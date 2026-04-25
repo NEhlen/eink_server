@@ -1,6 +1,9 @@
 from PIL import Image, ImageOps
-import os
-from palettes import waveshare_e6_ideal, waveshare_e6_empirical
+
+try:
+    from .palettes import waveshare_e6_ideal, waveshare_e6_empirical
+except ImportError:
+    from palettes import waveshare_e6_ideal, waveshare_e6_empirical
 
 
 def transform_image(image: Image.Image, palette: list) -> Image.Image:
@@ -14,6 +17,8 @@ def transform_image(image: Image.Image, palette: list) -> Image.Image:
     Returns:
         Image.Image: The transformed image.
     """
+    image = ImageOps.exif_transpose(image)
+
     # Convert the image to RGB mode if it's not already
     if image.mode != "RGB":
         image = image.convert("RGB")
@@ -34,7 +39,7 @@ def transform_image(image: Image.Image, palette: list) -> Image.Image:
         dither=Image.Dither.FLOYDSTEINBERG,
         palette=palette_img,
     )
-    return dithered
+    return dithered.convert("RGB")
 
 
 if __name__ == "__main__":
@@ -52,7 +57,6 @@ if __name__ == "__main__":
     # transformed_image = transform_image(input_image, waveshare_e6_empirical)
     transformed_image = transform_image(input_image, waveshare_e6_ideal)
     # to rgb
-    transformed_image.convert("RGB")
     # Save the transformed image
     transformed_image.save(output_image_path)
     print(f"Transformed image saved to {output_image_path}")

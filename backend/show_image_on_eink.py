@@ -20,6 +20,8 @@ import traceback
 
 logging.basicConfig(level=logging.DEBUG)
 
+epd = None
+
 try:
     logging.info("epd4in0e Demo")
 
@@ -38,13 +40,18 @@ try:
     # logging.info("Clear...")
     # epd.Clear()
 
-    logging.info("Goto Sleep...")
-    epd.sleep()
-
 except IOError as e:
     logging.info(e)
 
 except KeyboardInterrupt:
     logging.info("ctrl + c:")
-    epd4in0e.epdconfig.module_exit(cleanup=True)
     exit()
+
+finally:
+    if epd is not None:
+        logging.info("Goto Sleep...")
+        try:
+            epd.sleep()
+        except Exception:
+            logging.exception("epd.sleep() failed")
+            epd4in0e.epdconfig.module_exit(cleanup=True)
