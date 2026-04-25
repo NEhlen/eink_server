@@ -1,6 +1,8 @@
+import base64
 import json
 import logging
 import mimetypes
+import os
 import re
 import sys
 from datetime import datetime
@@ -11,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
+from urllib.request import Request, urlopen
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
@@ -30,6 +33,9 @@ PALETTES = {
     "empirical": waveshare_e6_empirical,
     "ideal": waveshare_e6_ideal,
 }
+XAI_MODEL = "grok-imagine-image"
+XAI_GENERATIONS_URL = "https://api.x.ai/v1/images/generations"
+XAI_ASPECT_RATIOS = {"2:3", "3:2"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -96,12 +102,17 @@ INDEX_HTML = """<!doctype html>
       align-items: start;
     }
     label { display: block; font-weight: 650; margin-bottom: 8px; }
-    input[type="file"] {
+    input[type="file"], textarea {
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 7px;
       padding: 10px;
       background: #fbfcfd;
+      font: inherit;
+    }
+    textarea {
+      min-height: 120px;
+      resize: vertical;
     }
     .field { margin-top: 14px; }
     .segmented {
@@ -194,6 +205,7 @@ INDEX_HTML = """<!doctype html>
   <main>
     <div class="tabs" role="tablist">
       <button class="tab active" id="uploadTab" type="button">Upload</button>
+      <button class="tab" id="generateTab" type="button">Generate</button>
       <button class="tab" id="historyTab" type="button">History</button>
     </div>
 
@@ -230,6 +242,48 @@ INDEX_HTML = """<!doctype html>
       </div>
     </section>
 
+    <section class="panel hidden" id="generatePanel">
+      <div class="upload-grid">
+        <form id="generateForm">
+          <label for="promptInput">Prompt</label>
+          <textarea id="promptInput" name="prompt" required></textarea>
+          <div class="field">
+            <label>Aspect</label>
+            <div class="segmented">
+              <input id="aspectPortrait" name="aspect_ratio" type="radio" value="2:3" checked>
+              <label for="aspectPortrait">2:3</label>
+              <input id="aspectLandscape" name="aspect_ratio" type="radio" value="3:2">
+              <label for="aspectLandscape">3:2</label>
+            </div>
+          </div>
+          <div class="field">
+            <label>Palette</label>
+            <div class="segmented">
+              <input id="generatePaletteEmpirical" name="palette" type="radio" value="empirical">
+              <label for="generatePaletteEmpirical">Empirical</label>
+              <input id="generatePaletteIdeal" name="palette" type="radio" value="ideal" checked>
+              <label for="generatePaletteIdeal">Ideal</label>
+            </div>
+          </div>
+          <div class="actions">
+            <button id="generateButton" type="submit">Generate and Dither</button>
+          </div>
+          <div class="status" id="generateStatus"></div>
+        </form>
+        <div id="generatePreviewEmpty" class="meta">No generated image in this session.</div>
+        <div id="generatePreview" class="preview hidden">
+          <img id="generatePreviewImage" alt="Generated dithered preview">
+          <div>
+            <div class="meta" id="generatePreviewMeta"></div>
+            <div class="actions">
+              <button id="displayGeneratedButton" type="button">Send to Screen</button>
+            </div>
+            <div class="status" id="generateDisplayStatus"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section class="panel hidden" id="historyPanel">
       <div class="gallery" id="gallery"></div>
       <div class="status" id="historyStatus"></div>
@@ -237,8 +291,10 @@ INDEX_HTML = """<!doctype html>
   </main>
   <script>
     const uploadTab = document.getElementById('uploadTab');
+    const generateTab = document.getElementById('generateTab');
     const historyTab = document.getElementById('historyTab');
     const uploadPanel = document.getElementById('uploadPanel');
+    const generatePanel = document.getElementById('generatePanel');
     const historyPanel = document.getElementById('historyPanel');
     const uploadForm = document.getElementById('uploadForm');
     const uploadButton = document.getElementById('uploadButton');
@@ -249,16 +305,29 @@ INDEX_HTML = """<!doctype html>
     const previewMeta = document.getElementById('previewMeta');
     const displayPreviewButton = document.getElementById('displayPreviewButton');
     const displayStatus = document.getElementById('displayStatus');
+    const generateForm = document.getElementById('generateForm');
+    const generateButton = document.getElementById('generateButton');
+    const generateStatus = document.getElementById('generateStatus');
+    const generatePreview = document.getElementById('generatePreview');
+    const generatePreviewEmpty = document.getElementById('generatePreviewEmpty');
+    const generatePreviewImage = document.getElementById('generatePreviewImage');
+    const generatePreviewMeta = document.getElementById('generatePreviewMeta');
+    const displayGeneratedButton = document.getElementById('displayGeneratedButton');
+    const generateDisplayStatus = document.getElementById('generateDisplayStatus');
     const refreshButton = document.getElementById('refreshButton');
     const gallery = document.getElementById('gallery');
     const historyStatus = document.getElementById('historyStatus');
     let selectedFilename = null;
+    let generatedFilename = null;
 
     function setTab(name) {
       const history = name === 'history';
-      uploadTab.classList.toggle('active', !history);
+      const generate = name === 'generate';
+      uploadTab.classList.toggle('active', !history && !generate);
+      generateTab.classList.toggle('active', generate);
       historyTab.classList.toggle('active', history);
-      uploadPanel.classList.toggle('hidden', history);
+      uploadPanel.classList.toggle('hidden', history || generate);
+      generatePanel.classList.toggle('hidden', !generate);
       historyPanel.classList.toggle('hidden', !history);
       if (history) loadHistory();
     }
@@ -326,6 +395,36 @@ INDEX_HTML = """<!doctype html>
       if (selectedFilename) displayImage(selectedFilename, displayStatus, displayPreviewButton);
     });
 
+    generateForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      generateButton.disabled = true;
+      setStatus(generateStatus, 'Generating and dithering...');
+      try {
+        const formData = new FormData(generateForm);
+        const payload = Object.fromEntries(formData.entries());
+        const result = await api('/api/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        generatedFilename = result.filename;
+        generatePreviewImage.src = result.url + '?t=' + Date.now();
+        generatePreviewMeta.innerHTML = `<strong>${escapeHtml(result.filename)}</strong><br>${result.width} x ${result.height}<br>${escapeHtml(result.aspect_ratio)} aspect<br>${escapeHtml(result.palette)} palette<br>${escapeHtml(result.created_at)}`;
+        generatePreview.classList.remove('hidden');
+        generatePreviewEmpty.classList.add('hidden');
+        setStatus(generateStatus, 'Ready to send.');
+        await loadHistory();
+      } catch (error) {
+        setStatus(generateStatus, error.message, true);
+      } finally {
+        generateButton.disabled = false;
+      }
+    });
+
+    displayGeneratedButton.addEventListener('click', () => {
+      if (generatedFilename) displayImage(generatedFilename, generateDisplayStatus, displayGeneratedButton);
+    });
+
     async function loadHistory() {
       setStatus(historyStatus, 'Loading...');
       try {
@@ -353,6 +452,7 @@ INDEX_HTML = """<!doctype html>
     }
 
     uploadTab.addEventListener('click', () => setTab('upload'));
+    generateTab.addEventListener('click', () => setTab('generate'));
     historyTab.addEventListener('click', () => setTab('history'));
     refreshButton.addEventListener('click', loadHistory);
     loadHistory();
@@ -375,6 +475,24 @@ def _safe_filename(filename: str) -> str:
     stem = Path(filename).stem.strip().lower()
     stem = re.sub(r"[^a-z0-9._-]+", "-", stem).strip(".-")
     return stem or "image"
+
+
+def _load_env_var(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value:
+        return value
+
+    for env_path in (Path.cwd() / ".env", ROOT_DIR / ".env"):
+        if not env_path.exists():
+            continue
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, raw_value = line.split("=", 1)
+            if key.strip() == name:
+                return raw_value.strip().strip("'\"")
+    return None
 
 
 def _dithered_path_from_name(filename: str) -> Path:
@@ -449,6 +567,67 @@ def _store_upload(filename: str, data: bytes, palette_name: str) -> dict:
     return _image_info(dithered_path) | {"raw_filename": raw_path.name, "palette": palette_name}
 
 
+def _store_generated_image(prompt: str, aspect_ratio: str, palette_name: str, data: bytes) -> dict:
+    with Image.open(BytesIO(data)) as input_image:
+        input_image.load()
+        prepared = ImageOps.exif_transpose(input_image)
+        image_format = (prepared.format or input_image.format or "png").lower()
+        if image_format == "jpeg":
+            image_format = "jpg"
+        dithered = transform_image(prepared, PALETTES[palette_name])
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    aspect_token = aspect_ratio.replace(":", "x")
+    base = f"{timestamp}-xai-{aspect_token}-{palette_name}-{_safe_filename(prompt)[:80]}"
+    raw_path = RAW_DIR / f"{base}.{image_format}"
+    dithered_path = DITHERED_DIR / f"dith_{base}.png"
+
+    raw_path.write_bytes(data)
+    dithered.save(dithered_path)
+    return _image_info(dithered_path) | {
+        "raw_filename": raw_path.name,
+        "palette": palette_name,
+        "aspect_ratio": aspect_ratio,
+        "prompt": prompt,
+    }
+
+
+def _generate_xai_image(prompt: str, aspect_ratio: str) -> bytes:
+    api_key = _load_env_var("XAI_API_KEY")
+    if not api_key:
+        raise ValueError("Missing XAI_API_KEY in environment or .env")
+
+    payload = {
+        "model": XAI_MODEL,
+        "prompt": prompt,
+        "aspect_ratio": aspect_ratio,
+        "response_format": "b64_json",
+    }
+    request = Request(
+        XAI_GENERATIONS_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=120) as response:
+            body = response.read()
+    except Exception as exc:
+        raise RuntimeError(f"xAI request failed: {exc}") from exc
+
+    response_payload = json.loads(body)
+    image_data = response_payload.get("data", [{}])[0]
+    if image_data.get("b64_json"):
+        return base64.b64decode(image_data["b64_json"])
+    if image_data.get("url"):
+        with urlopen(image_data["url"], timeout=120) as image_response:
+            return image_response.read()
+    raise RuntimeError("xAI response did not include image data")
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "EInkServer/0.1"
 
@@ -467,6 +646,8 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/upload":
             self._handle_upload()
+        elif parsed.path == "/api/generate":
+            self._handle_generate()
         elif parsed.path == "/api/display":
             self._handle_display()
         else:
@@ -515,6 +696,30 @@ class Handler(BaseHTTPRequestHandler):
             info = _store_upload(filename, data, palette_name)
         except (OSError, UnidentifiedImageError, ValueError) as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        self._send_json(info, HTTPStatus.CREATED)
+
+    def _handle_generate(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            prompt = str(payload.get("prompt", "")).strip()
+            palette_name = str(payload.get("palette", "ideal")).strip().lower()
+            aspect_ratio = str(payload.get("aspect_ratio", "2:3")).strip()
+            if not prompt:
+                raise ValueError("Prompt is required")
+            if palette_name not in PALETTES:
+                raise ValueError("Unknown palette")
+            if aspect_ratio not in XAI_ASPECT_RATIOS:
+                raise ValueError("Aspect ratio must be 2:3 or 3:2")
+            image_bytes = _generate_xai_image(prompt, aspect_ratio)
+            info = _store_generated_image(prompt, aspect_ratio, palette_name, image_bytes)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        except (OSError, UnidentifiedImageError, RuntimeError, json.JSONDecodeError) as exc:
+            logger.exception("xAI generation failed")
+            self._send_json({"error": f"xAI generation failed: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
         self._send_json(info, HTTPStatus.CREATED)
 

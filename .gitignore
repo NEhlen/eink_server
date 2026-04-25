@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local secrets
+.env
+.env
+images/*
+images_raw/*
