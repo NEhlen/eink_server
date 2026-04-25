@@ -74,9 +74,10 @@ EINK_DRY_RUN=1 uv run eink-server --host 127.0.0.1 --port 8000
 
 Open `http://<pi-address>:8000/`. The upload tab stores the original image in
 `images_raw/`, crops it to the Waveshare `400x600`/`600x400` aspect ratio,
-Floyd-Steinberg dithers it to the six-color palette, and stores the display
-image in `images/`. The history tab lists old dithered images and can send any
-of them to the screen.
+Floyd-Steinberg dithers it to the selected six-color palette, and stores the
+display image in `images/`. The empirical palette uses measured display-like
+colors; the default ideal palette uses full RGB primaries. The history tab
+lists old dithered images and can send any of them to the screen.
 
 The display path calls `epd.sleep()` in a `finally` block after hardware access
 has started. If `epd.sleep()` itself raises, it attempts

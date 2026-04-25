@@ -19,13 +19,17 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from backend.eink_display import display_image_on_eink
-from backend.image_transform.palettes import waveshare_e6_ideal
+from backend.image_transform.palettes import waveshare_e6_empirical, waveshare_e6_ideal
 from backend.image_transform.transform_image import transform_image
 
 RAW_DIR = ROOT_DIR / "images_raw"
 DITHERED_DIR = ROOT_DIR / "images"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp", ".tif", ".tiff"}
+PALETTES = {
+    "empirical": waveshare_e6_empirical,
+    "ideal": waveshare_e6_ideal,
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -99,6 +103,36 @@ INDEX_HTML = """<!doctype html>
       padding: 10px;
       background: #fbfcfd;
     }
+    .field { margin-top: 14px; }
+    .segmented {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 4px;
+      background: #fbfcfd;
+    }
+    .segmented input {
+      inline-size: 1px;
+      block-size: 1px;
+      opacity: 0;
+      position: absolute;
+    }
+    .segmented label {
+      margin: 0;
+      min-height: 34px;
+      display: grid;
+      place-items: center;
+      border-radius: 6px;
+      color: var(--muted);
+      cursor: pointer;
+      font-weight: 700;
+    }
+    .segmented input:checked + label {
+      background: var(--accent);
+      color: white;
+    }
     button {
       border: 1px solid var(--accent);
       background: var(--accent);
@@ -168,6 +202,15 @@ INDEX_HTML = """<!doctype html>
         <form id="uploadForm">
           <label for="imageInput">Image</label>
           <input id="imageInput" name="image" type="file" accept="image/*" required>
+          <div class="field">
+            <label>Palette</label>
+            <div class="segmented">
+              <input id="paletteEmpirical" name="palette" type="radio" value="empirical">
+              <label for="paletteEmpirical">Empirical</label>
+              <input id="paletteIdeal" name="palette" type="radio" value="ideal" checked>
+              <label for="paletteIdeal">Ideal</label>
+            </div>
+          </div>
           <div class="actions">
             <button id="uploadButton" type="submit">Upload and Dither</button>
           </div>
@@ -250,7 +293,7 @@ INDEX_HTML = """<!doctype html>
         const result = await api('/api/upload', { method: 'POST', body: formData });
         selectedFilename = result.filename;
         previewImage.src = result.url + '?t=' + Date.now();
-        previewMeta.innerHTML = `<strong>${escapeHtml(result.filename)}</strong><br>${result.width} x ${result.height}<br>${escapeHtml(result.created_at)}`;
+        previewMeta.innerHTML = `<strong>${escapeHtml(result.filename)}</strong><br>${result.width} x ${result.height}<br>${escapeHtml(result.palette)} palette<br>${escapeHtml(result.created_at)}`;
         preview.classList.remove('hidden');
         previewEmpty.classList.add('hidden');
         setStatus(uploadStatus, 'Ready to send.');
@@ -359,24 +402,34 @@ def _image_info(path: Path) -> dict:
     }
 
 
-def _parse_upload(content_type: str, body: bytes) -> tuple[str, bytes]:
+def _parse_upload(content_type: str, body: bytes) -> tuple[str, bytes, str]:
     if not content_type.startswith("multipart/form-data"):
         raise ValueError("Expected multipart/form-data")
 
     message = BytesParser(policy=policy.default).parsebytes(
         f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + body
     )
+    filename = None
+    data = None
+    palette_name = "ideal"
     for part in message.iter_parts():
         if part.get_content_disposition() == "form-data" and part.get_param("name", header="content-disposition") == "image":
             filename = part.get_filename() or "image"
             data = part.get_payload(decode=True)
             if not data:
                 raise ValueError("Uploaded file is empty")
-            return filename, data
-    raise ValueError("Missing image file")
+        elif part.get_content_disposition() == "form-data" and part.get_param("name", header="content-disposition") == "palette":
+            payload = part.get_payload(decode=True)
+            if payload:
+                palette_name = payload.decode("utf-8", errors="ignore").strip().lower()
+    if filename is None or data is None:
+        raise ValueError("Missing image file")
+    if palette_name not in PALETTES:
+        raise ValueError("Unknown palette")
+    return filename, data, palette_name
 
 
-def _store_upload(filename: str, data: bytes) -> dict:
+def _store_upload(filename: str, data: bytes, palette_name: str) -> dict:
     extension = Path(filename).suffix.lower()
     if extension not in ALLOWED_EXTENSIONS:
         extension = ".png"
@@ -384,16 +437,16 @@ def _store_upload(filename: str, data: bytes) -> dict:
     with Image.open(BytesIO(data)) as input_image:
         input_image.load()
         prepared = ImageOps.exif_transpose(input_image)
-        dithered = transform_image(prepared, waveshare_e6_ideal)
+        dithered = transform_image(prepared, PALETTES[palette_name])
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    base = f"{timestamp}-{_safe_filename(filename)}"
+    base = f"{timestamp}-{palette_name}-{_safe_filename(filename)}"
     raw_path = RAW_DIR / f"{base}{extension}"
     dithered_path = DITHERED_DIR / f"dith_{base}.png"
 
     raw_path.write_bytes(data)
     dithered.save(dithered_path)
-    return _image_info(dithered_path) | {"raw_filename": raw_path.name}
+    return _image_info(dithered_path) | {"raw_filename": raw_path.name, "palette": palette_name}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -458,8 +511,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            filename, data = _parse_upload(self.headers.get("Content-Type", ""), self.rfile.read(length))
-            info = _store_upload(filename, data)
+            filename, data, palette_name = _parse_upload(self.headers.get("Content-Type", ""), self.rfile.read(length))
+            info = _store_upload(filename, data, palette_name)
         except (OSError, UnidentifiedImageError, ValueError) as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
