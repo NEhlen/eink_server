@@ -1,12 +1,32 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "eink-server"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "gpiozero>=2.0.1",
     "numpy>=2.4.4",
     "pillow>=12.2.0",
     "spidev>=3.8",
 ]
+
+[project.scripts]
+eink-server = "backend.server:main"
+
+[tool.setuptools]
+packages = [
+    "backend",
+    "backend.image_transform",
+    "waveshare_epd",
+]
+
+[tool.setuptools.package-dir]
+waveshare_epd = "lib/waveshare_epd"
+
+[tool.setuptools.package-data]
+waveshare_epd = ["*.so"]

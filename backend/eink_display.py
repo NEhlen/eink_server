@@ -1,17 +1,10 @@
 import logging
 import os
-import sys
 import threading
 import time
 from pathlib import Path
 
 from PIL import Image
-
-ROOT_DIR = Path(__file__).resolve().parent.parent
-LIB_DIR = ROOT_DIR / "lib"
-
-if str(LIB_DIR) not in sys.path:
-    sys.path.append(str(LIB_DIR))
 
 logger = logging.getLogger(__name__)
 _display_lock = threading.Lock()
