@@ -5,6 +5,7 @@ import mimetypes
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from email import policy
 from email.parser import BytesParser
@@ -36,6 +37,7 @@ PALETTES = {
 XAI_MODEL = "grok-imagine-image"
 XAI_GENERATIONS_URL = "https://api.x.ai/v1/images/generations"
 XAI_ASPECT_RATIOS = {"2:3", "3:2"}
+RAW_CLEANUP_DAYS = 30
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -155,6 +157,7 @@ INDEX_HTML = """<!doctype html>
       cursor: pointer;
     }
     button.secondary { background: white; color: var(--accent-dark); }
+    button.danger { background: white; border-color: var(--danger); color: var(--danger); }
     button:disabled { opacity: 0.55; cursor: wait; }
     .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
     .preview {
@@ -173,6 +176,14 @@ INDEX_HTML = """<!doctype html>
     .meta { color: var(--muted); font-size: 14px; line-height: 1.5; }
     .status { min-height: 22px; margin-top: 12px; font-size: 14px; }
     .status.error { color: var(--danger); }
+    .history-tools {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+    }
     .gallery {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
@@ -285,6 +296,10 @@ INDEX_HTML = """<!doctype html>
     </section>
 
     <section class="panel hidden" id="historyPanel">
+      <div class="history-tools">
+        <div class="meta">Raw source files older than 30 days can be removed without deleting dithered images.</div>
+        <button class="secondary" id="cleanupRawButton" type="button">Clean Raw Files</button>
+      </div>
       <div class="gallery" id="gallery"></div>
       <div class="status" id="historyStatus"></div>
     </section>
@@ -315,6 +330,7 @@ INDEX_HTML = """<!doctype html>
     const displayGeneratedButton = document.getElementById('displayGeneratedButton');
     const generateDisplayStatus = document.getElementById('generateDisplayStatus');
     const refreshButton = document.getElementById('refreshButton');
+    const cleanupRawButton = document.getElementById('cleanupRawButton');
     const gallery = document.getElementById('gallery');
     const historyStatus = document.getElementById('historyStatus');
     let selectedFilename = null;
@@ -391,6 +407,33 @@ INDEX_HTML = """<!doctype html>
       }
     }
 
+    async function deleteImage(filename, statusNode, card, button) {
+      if (!confirm('Delete this image and its source file?')) return;
+      button.disabled = true;
+      setStatus(statusNode, 'Deleting...');
+      try {
+        await api('/api/images/' + encodeURIComponent(filename), { method: 'DELETE' });
+        card.remove();
+        setStatus(historyStatus, gallery.children.length ? '' : 'No dithered images yet.');
+      } catch (error) {
+        setStatus(statusNode, error.message, true);
+        button.disabled = false;
+      }
+    }
+
+    async function cleanupRawFiles() {
+      cleanupRawButton.disabled = true;
+      setStatus(historyStatus, 'Cleaning raw source files...');
+      try {
+        const result = await api('/api/raw/cleanup', { method: 'POST' });
+        setStatus(historyStatus, `Deleted ${result.deleted.length} raw source file${result.deleted.length === 1 ? '' : 's'}.`);
+      } catch (error) {
+        setStatus(historyStatus, error.message, true);
+      } finally {
+        cleanupRawButton.disabled = false;
+      }
+    }
+
     displayPreviewButton.addEventListener('click', () => {
       if (selectedFilename) displayImage(selectedFilename, displayStatus, displayPreviewButton);
     });
@@ -437,12 +480,17 @@ INDEX_HTML = """<!doctype html>
             <img src="${escapeHtml(image.url)}" alt="${escapeHtml(image.filename)}">
             <div class="thumb-title">${escapeHtml(image.filename)}</div>
             <div class="meta">${image.width} x ${image.height}<br>${escapeHtml(image.created_at)}</div>
-            <div class="actions"><button type="button">Send to Screen</button></div>
+            <div class="actions">
+              <button type="button" data-action="display">Send to Screen</button>
+              <button class="danger" type="button" data-action="delete">Delete</button>
+            </div>
             <div class="status"></div>
           `;
-          const button = card.querySelector('button');
+          const button = card.querySelector('[data-action="display"]');
+          const deleteButton = card.querySelector('[data-action="delete"]');
           const status = card.querySelector('.status');
           button.addEventListener('click', () => displayImage(image.filename, status, button));
+          deleteButton.addEventListener('click', () => deleteImage(image.filename, status, card, deleteButton));
           gallery.appendChild(card);
         }
         setStatus(historyStatus, result.images.length ? '' : 'No dithered images yet.');
@@ -455,6 +503,7 @@ INDEX_HTML = """<!doctype html>
     generateTab.addEventListener('click', () => setTab('generate'));
     historyTab.addEventListener('click', () => setTab('history'));
     refreshButton.addEventListener('click', loadHistory);
+    cleanupRawButton.addEventListener('click', cleanupRawFiles);
     loadHistory();
   </script>
 </body>
@@ -503,6 +552,50 @@ def _dithered_path_from_name(filename: str) -> Path:
     if path.suffix.lower() != ".png":
         raise ValueError("Only stored PNG images can be displayed")
     return path
+
+
+def _delete_image_files(filename: str) -> dict:
+    dithered_path = _dithered_path_from_name(filename)
+    if not dithered_path.exists():
+        raise FileNotFoundError("Image not found")
+
+    deleted = []
+    dithered_stem = dithered_path.stem
+    raw_stem = dithered_stem.removeprefix("dith_")
+    raw_candidates = [
+        path
+        for path in RAW_DIR.iterdir()
+        if path.is_file() and path.stem == raw_stem
+    ]
+
+    for path in [dithered_path, *raw_candidates]:
+        try:
+            path.unlink()
+            deleted.append(path.name)
+        except FileNotFoundError:
+            pass
+
+    return {"deleted": deleted}
+
+
+def _cleanup_old_raw_files(days: int = RAW_CLEANUP_DAYS) -> dict:
+    cutoff = time.time() - (days * 24 * 60 * 60)
+    deleted = []
+    if not RAW_DIR.exists():
+        return {"deleted": deleted, "days": days}
+
+    for path in RAW_DIR.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            if path.stat().st_mtime >= cutoff:
+                continue
+            path.unlink()
+            deleted.append(path.name)
+        except FileNotFoundError:
+            continue
+
+    return {"deleted": deleted, "days": days}
 
 
 def _image_info(path: Path) -> dict:
@@ -648,8 +741,17 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_upload()
         elif parsed.path == "/api/generate":
             self._handle_generate()
+        elif parsed.path == "/api/raw/cleanup":
+            self._handle_cleanup_raw()
         elif parsed.path == "/api/display":
             self._handle_display()
+        else:
+            self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/images/"):
+            self._handle_delete_image(parsed.path.removeprefix("/api/images/"))
         else:
             self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
 
@@ -677,6 +779,30 @@ class Handler(BaseHTTPRequestHandler):
             return
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         self._send_bytes(path.read_bytes(), content_type)
+
+    def _handle_delete_image(self, raw_name: str) -> None:
+        try:
+            result = _delete_image_files(unquote(raw_name))
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            return
+        except OSError as exc:
+            logger.exception("Delete failed")
+            self._send_json({"error": f"Delete failed: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        self._send_json(result)
+
+    def _handle_cleanup_raw(self) -> None:
+        try:
+            result = _cleanup_old_raw_files()
+        except OSError as exc:
+            logger.exception("Raw cleanup failed")
+            self._send_json({"error": f"Raw cleanup failed: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        self._send_json(result)
 
     def _handle_upload(self) -> None:
         try:
@@ -755,6 +881,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def run(host: str = "0.0.0.0", port: int = 8000) -> None:
     _ensure_dirs()
+    cleanup_result = _cleanup_old_raw_files()
+    if cleanup_result["deleted"]:
+        logger.info("Deleted %d raw source files older than %d days", len(cleanup_result["deleted"]), cleanup_result["days"])
     server = ThreadingHTTPServer((host, port), Handler)
     logger.info("Serving on http://%s:%s", host, port)
     try:
