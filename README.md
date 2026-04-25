@@ -52,6 +52,14 @@ interfaces, then log out and back in:
 sudo usermod -aG gpio,spi "$USER"
 ```
 
+The display code uses `gpiozero` with the `lgpio` pin factory. If you see
+warnings about falling back from `lgpio` or an error under `/sys/class/gpio`,
+refresh the uv environment so the Python `lgpio` package is installed:
+
+```bash
+uv sync
+```
+
 Run the webserver with uv:
 
 ```bash

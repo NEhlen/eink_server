@@ -23,6 +23,8 @@ def display_image_on_eink(image_path: Path) -> None:
             logger.info("EINK_DRY_RUN=1: would display %s at %sx%s", image_path, *image.size)
         return
 
+    os.environ.setdefault("GPIOZERO_PIN_FACTORY", "lgpio")
+
     with _display_lock:
         epd = None
         epdconfig = None
