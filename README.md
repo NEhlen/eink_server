@@ -80,7 +80,13 @@ image API using `XAI_API_KEY` from the environment or `.env`, then dithers the
 generated image the same way. Choose `2:3` for portrait or `3:2` for landscape.
 The empirical palette uses measured display-like colors; the default ideal
 palette uses full RGB primaries. The history tab lists old dithered images and
-can send any of them to the screen.
+can send any of them to the screen. Deleting an item from history removes the
+dithered image and the matching original source file from disk.
+
+Raw source files in `images_raw/` are cleaned automatically when the server
+starts if they are older than 30 days. The history tab also has a manual cleanup
+button for the same rule. This cleanup does not remove dithered images from
+`images/`.
 
 The display path calls `epd.sleep()` in a `finally` block after hardware access
 has started. If `epd.sleep()` itself raises, it attempts
