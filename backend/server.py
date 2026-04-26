@@ -45,6 +45,7 @@ XAI_GENERATIONS_URL = "https://api.x.ai/v1/images/generations"
 XAI_EDITS_URL = "https://api.x.ai/v1/images/edits"
 XAI_ASPECT_RATIOS = {"2:3", "3:2"}
 RAW_CLEANUP_DAYS = 30
+BOOST_MODES = {"off", "mild"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -241,6 +242,15 @@ INDEX_HTML = """<!doctype html>
               <label for="paletteIdeal">Ideal</label>
             </div>
           </div>
+          <div class="field">
+            <label>Boost</label>
+            <div class="segmented">
+              <input id="uploadBoostOff" name="boost" type="radio" value="off" checked>
+              <label for="uploadBoostOff">Off</label>
+              <input id="uploadBoostMild" name="boost" type="radio" value="mild">
+              <label for="uploadBoostMild">Mild</label>
+            </div>
+          </div>
           <div class="actions">
             <button id="uploadButton" type="submit">Upload and Dither</button>
           </div>
@@ -285,6 +295,15 @@ INDEX_HTML = """<!doctype html>
               <label for="generatePaletteCalibrated">Calibrated</label>
               <input id="generatePaletteIdeal" name="palette" type="radio" value="ideal">
               <label for="generatePaletteIdeal">Ideal</label>
+            </div>
+          </div>
+          <div class="field">
+            <label>Boost</label>
+            <div class="segmented">
+              <input id="generateBoostOff" name="boost" type="radio" value="off" checked>
+              <label for="generateBoostOff">Off</label>
+              <input id="generateBoostMild" name="boost" type="radio" value="mild">
+              <label for="generateBoostMild">Mild</label>
             </div>
           </div>
           <div class="actions">
@@ -398,7 +417,7 @@ INDEX_HTML = """<!doctype html>
         const result = await api('/api/upload', { method: 'POST', body: formData });
         selectedFilename = result.filename;
         previewImage.src = result.url + '?t=' + Date.now();
-        previewMeta.innerHTML = `<strong>${escapeHtml(result.filename)}</strong><br>${result.width} x ${result.height}<br>${escapeHtml(result.palette)} palette<br>${escapeHtml(result.created_at)}`;
+        previewMeta.innerHTML = `<strong>${escapeHtml(result.filename)}</strong><br>${result.width} x ${result.height}<br>${escapeHtml(result.palette)} palette<br>${escapeHtml(result.boost)} boost<br>${escapeHtml(result.created_at)}`;
         preview.classList.remove('hidden');
         previewEmpty.classList.add('hidden');
         setStatus(uploadStatus, 'Ready to send.');
@@ -467,7 +486,7 @@ INDEX_HTML = """<!doctype html>
         const result = await api('/api/generate', { method: 'POST', body: formData });
         generatedFilename = result.filename;
         generatePreviewImage.src = result.url + '?t=' + Date.now();
-        generatePreviewMeta.innerHTML = `<strong>${escapeHtml(result.filename)}</strong><br>${result.width} x ${result.height}<br>${escapeHtml(result.aspect_ratio)} aspect<br>${escapeHtml(result.palette)} palette<br>${escapeHtml(result.created_at)}`;
+        generatePreviewMeta.innerHTML = `<strong>${escapeHtml(result.filename)}</strong><br>${result.width} x ${result.height}<br>${escapeHtml(result.aspect_ratio)} aspect<br>${escapeHtml(result.palette)} palette<br>${escapeHtml(result.boost)} boost<br>${escapeHtml(result.created_at)}`;
         generatePreview.classList.remove('hidden');
         generatePreviewEmpty.classList.add('hidden');
         setStatus(generateStatus, 'Ready to send.');
@@ -670,7 +689,7 @@ def _history_image_info(path: Path, mode: str) -> dict:
     return info
 
 
-def _parse_upload(content_type: str, body: bytes) -> tuple[str, bytes, str]:
+def _parse_upload(content_type: str, body: bytes) -> tuple[str, bytes, str, str]:
     if not content_type.startswith("multipart/form-data"):
         raise ValueError("Expected multipart/form-data")
 
@@ -680,6 +699,7 @@ def _parse_upload(content_type: str, body: bytes) -> tuple[str, bytes, str]:
     filename = None
     data = None
     palette_name = "calibrated"
+    boost = "off"
     for part in message.iter_parts():
         if part.get_content_disposition() == "form-data" and part.get_param("name", header="content-disposition") == "image":
             filename = part.get_filename() or "image"
@@ -690,14 +710,20 @@ def _parse_upload(content_type: str, body: bytes) -> tuple[str, bytes, str]:
             payload = _payload_bytes(part.get_payload(decode=True))
             if payload:
                 palette_name = payload.decode("utf-8", errors="ignore").strip().lower()
+        elif part.get_content_disposition() == "form-data" and part.get_param("name", header="content-disposition") == "boost":
+            payload = _payload_bytes(part.get_payload(decode=True))
+            if payload:
+                boost = payload.decode("utf-8", errors="ignore").strip().lower()
     if filename is None or data is None:
         raise ValueError("Missing image file")
     if palette_name not in PALETTES:
         raise ValueError("Unknown palette")
-    return filename, data, palette_name
+    if boost not in BOOST_MODES:
+        raise ValueError("Unknown boost mode")
+    return filename, data, palette_name, boost
 
 
-def _parse_generate_upload(content_type: str, body: bytes) -> tuple[str, str, str, bytes | None, str]:
+def _parse_generate_upload(content_type: str, body: bytes) -> tuple[str, str, str, str, bytes | None, str]:
     if not content_type.startswith("multipart/form-data"):
         raise ValueError("Expected multipart/form-data")
 
@@ -709,6 +735,7 @@ def _parse_generate_upload(content_type: str, body: bytes) -> tuple[str, str, st
     prompt = ""
     palette_name = "calibrated"
     aspect_ratio = "2:3"
+    boost = "off"
 
     for part in message.iter_parts():
         if part.get_content_disposition() != "form-data":
@@ -734,6 +761,10 @@ def _parse_generate_upload(content_type: str, body: bytes) -> tuple[str, str, st
             payload = _payload_bytes(part.get_payload(decode=True))
             if payload:
                 aspect_ratio = payload.decode("utf-8", errors="ignore").strip()
+        elif field_name == "boost":
+            payload = _payload_bytes(part.get_payload(decode=True))
+            if payload:
+                boost = payload.decode("utf-8", errors="ignore").strip().lower()
 
     if not prompt:
         raise ValueError("Prompt is required")
@@ -741,12 +772,14 @@ def _parse_generate_upload(content_type: str, body: bytes) -> tuple[str, str, st
         raise ValueError("Unknown palette")
     if aspect_ratio not in XAI_ASPECT_RATIOS:
         raise ValueError("Aspect ratio must be 2:3 or 3:2")
+    if boost not in BOOST_MODES:
+        raise ValueError("Unknown boost mode")
     if image_data is not None and not image_content_type.startswith("image/"):
         raise ValueError("Uploaded file must be an image")
-    return prompt, aspect_ratio, palette_name, image_data, image_content_type
+    return prompt, aspect_ratio, palette_name, boost, image_data, image_content_type
 
 
-def _store_upload(filename: str, data: bytes, palette_name: str) -> dict:
+def _store_upload(filename: str, data: bytes, palette_name: str, boost: str = "off") -> dict:
     _ensure_dirs()
     extension = Path(filename).suffix.lower()
     if extension not in ALLOWED_EXTENSIONS:
@@ -757,15 +790,15 @@ def _store_upload(filename: str, data: bytes, palette_name: str) -> dict:
         prepared = ImageOps.exif_transpose(input_image)
         if palette_name == "calibrated":
             display, preview = transform_image_pair(
-                prepared, waveshare_e6_ideal, waveshare_e6_calibrated
+                prepared, waveshare_e6_ideal, waveshare_e6_calibrated, boost=boost
             )
         else:
             preview, display = transform_image_pair(
-                prepared, PALETTES[palette_name], waveshare_e6_ideal
+                prepared, PALETTES[palette_name], waveshare_e6_ideal, boost=boost
             )
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    base = f"{timestamp}-{palette_name}-{_safe_filename(filename)}"
+    base = f"{timestamp}-{palette_name}-{boost}-{_safe_filename(filename)}"
     raw_path = RAW_DIR / f"{base}{extension}"
     dithered_path = DITHERED_DIR / f"dith_{base}.png"
     display_path = DISPLAY_DIR / dithered_path.name
@@ -773,7 +806,11 @@ def _store_upload(filename: str, data: bytes, palette_name: str) -> dict:
     raw_path.write_bytes(data)
     preview.save(dithered_path)
     display.save(display_path)
-    return _image_info(dithered_path) | {"raw_filename": raw_path.name, "palette": palette_name}
+    return _image_info(dithered_path) | {
+        "raw_filename": raw_path.name,
+        "palette": palette_name,
+        "boost": boost,
+    }
 
 
 def _store_generated_image(
@@ -782,6 +819,7 @@ def _store_generated_image(
     palette_name: str,
     data: bytes,
     source: str = "xai",
+    boost: str = "off",
 ) -> dict:
     _ensure_dirs()
     with Image.open(BytesIO(data)) as input_image:
@@ -793,16 +831,24 @@ def _store_generated_image(
         target = _target_from_aspect_ratio(aspect_ratio)
         if palette_name == "calibrated":
             display, preview = transform_image_pair(
-                prepared, waveshare_e6_ideal, waveshare_e6_calibrated, target=target
+                prepared,
+                waveshare_e6_ideal,
+                waveshare_e6_calibrated,
+                target=target,
+                boost=boost,
             )
         else:
             preview, display = transform_image_pair(
-                prepared, PALETTES[palette_name], waveshare_e6_ideal, target=target
+                prepared,
+                PALETTES[palette_name],
+                waveshare_e6_ideal,
+                target=target,
+                boost=boost,
             )
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     aspect_token = aspect_ratio.replace(":", "x")
-    base = f"{timestamp}-{source}-{aspect_token}-{palette_name}-{_safe_filename(prompt)[:80]}"
+    base = f"{timestamp}-{source}-{aspect_token}-{palette_name}-{boost}-{_safe_filename(prompt)[:80]}"
     raw_path = RAW_DIR / f"{base}.{image_format}"
     dithered_path = DITHERED_DIR / f"dith_{base}.png"
     display_path = DISPLAY_DIR / dithered_path.name
@@ -813,6 +859,7 @@ def _store_generated_image(
     return _image_info(dithered_path) | {
         "raw_filename": raw_path.name,
         "palette": palette_name,
+        "boost": boost,
         "aspect_ratio": aspect_ratio,
         "prompt": prompt,
     }
@@ -1011,8 +1058,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            filename, data, palette_name = _parse_upload(self.headers.get("Content-Type", ""), self.rfile.read(length))
-            info = _store_upload(filename, data, palette_name)
+            filename, data, palette_name, boost = _parse_upload(
+                self.headers.get("Content-Type", ""), self.rfile.read(length)
+            )
+            info = _store_upload(filename, data, palette_name, boost)
         except (OSError, UnidentifiedImageError, ValueError) as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
@@ -1032,7 +1081,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            prompt, aspect_ratio, palette_name, source_data, content_type = _parse_generate_upload(
+            prompt, aspect_ratio, palette_name, boost, source_data, content_type = _parse_generate_upload(
                 self.headers.get("Content-Type", ""), self.rfile.read(length)
             )
             if source_data is None:
@@ -1041,7 +1090,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 image_bytes = _style_transfer_xai_image(source_data, content_type, prompt, aspect_ratio)
                 source = "xai-style"
-            info = _store_generated_image(prompt, aspect_ratio, palette_name, image_bytes, source=source)
+            info = _store_generated_image(
+                prompt, aspect_ratio, palette_name, image_bytes, source=source, boost=boost
+            )
         except ValueError as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return

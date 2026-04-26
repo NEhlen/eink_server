@@ -1,4 +1,4 @@
-from PIL import Image, ImageOps
+from PIL import Image, ImageEnhance, ImageOps
 
 try:
     from .palettes import (
@@ -10,7 +10,20 @@ except ImportError:
     from palettes import waveshare_e6_calibrated, waveshare_e6_empirical, waveshare_e6_ideal
 
 
-def _prepared_image(image: Image.Image, target: tuple[int, int] | None = None) -> Image.Image:
+def _boost_image(image: Image.Image, boost: str) -> Image.Image:
+    if boost == "off":
+        return image
+    if boost != "mild":
+        raise ValueError("Unknown boost mode")
+
+    image = ImageEnhance.Contrast(image).enhance(1.15)
+    image = ImageEnhance.Color(image).enhance(1.18)
+    return ImageEnhance.Sharpness(image).enhance(1.08)
+
+
+def _prepared_image(
+    image: Image.Image, target: tuple[int, int] | None = None, boost: str = "off"
+) -> Image.Image:
     image = ImageOps.exif_transpose(image)
 
     if image.mode != "RGB":
@@ -21,9 +34,10 @@ def _prepared_image(image: Image.Image, target: tuple[int, int] | None = None) -
         aspect = width / height
         target = (400, 600) if aspect < 1 else (600, 400)
 
-    return ImageOps.fit(
+    prepared = ImageOps.fit(
         image, target, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
     )
+    return _boost_image(prepared, boost)
 
 
 def _palette_image(palette: list) -> Image.Image:
@@ -37,8 +51,9 @@ def transform_image_pair(
     preview_palette: list,
     display_palette: list,
     target: tuple[int, int] | None = None,
+    boost: str = "off",
 ) -> tuple[Image.Image, Image.Image]:
-    prepared = _prepared_image(image, target)
+    prepared = _prepared_image(image, target, boost)
     dithered = prepared.quantize(
         colors=len(preview_palette),
         dither=Image.Dither.FLOYDSTEINBERG,
@@ -52,7 +67,9 @@ def transform_image_pair(
     return dithered.convert("RGB"), display_indexed.convert("RGB")
 
 
-def transform_image(image: Image.Image, palette: list, target: tuple[int, int] | None = None) -> Image.Image:
+def transform_image(
+    image: Image.Image, palette: list, target: tuple[int, int] | None = None, boost: str = "off"
+) -> Image.Image:
     """
     Transforms the input image to match the given palette.
 
@@ -63,7 +80,7 @@ def transform_image(image: Image.Image, palette: list, target: tuple[int, int] |
     Returns:
         Image.Image: The transformed image.
     """
-    preview, _ = transform_image_pair(image, palette, palette, target)
+    preview, _ = transform_image_pair(image, palette, palette, target, boost)
     return preview
 
 
