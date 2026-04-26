@@ -13,7 +13,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -233,7 +233,7 @@ INDEX_HTML = """<!doctype html>
           <label for="imageInput">Image</label>
           <input id="imageInput" name="image" type="file" accept="image/*" required>
           <div class="field">
-            <label>Palette</label>
+            <label>Browser Preview Palette</label>
             <div class="segmented">
               <input id="paletteCalibrated" name="palette" type="radio" value="calibrated" checked>
               <label for="paletteCalibrated">Calibrated</label>
@@ -279,7 +279,7 @@ INDEX_HTML = """<!doctype html>
             </div>
           </div>
           <div class="field">
-            <label>Palette</label>
+            <label>Browser Preview Palette</label>
             <div class="segmented">
               <input id="generatePaletteCalibrated" name="palette" type="radio" value="calibrated" checked>
               <label for="generatePaletteCalibrated">Calibrated</label>
@@ -309,7 +309,15 @@ INDEX_HTML = """<!doctype html>
     <section class="panel hidden" id="historyPanel">
       <div class="history-tools">
         <div class="meta">Raw source files older than 30 days can be removed without deleting dithered images.</div>
-        <button class="secondary" id="cleanupRawButton" type="button">Clean Raw Files</button>
+        <div class="actions">
+          <div class="segmented">
+            <input id="historyPreviewMode" name="history_image_mode" type="radio" value="preview" checked>
+            <label for="historyPreviewMode">Preview</label>
+            <input id="historyDisplayMode" name="history_image_mode" type="radio" value="display">
+            <label for="historyDisplayMode">Display</label>
+          </div>
+          <button class="secondary" id="cleanupRawButton" type="button">Clean Raw Files</button>
+        </div>
       </div>
       <div class="gallery" id="gallery"></div>
       <div class="status" id="historyStatus"></div>
@@ -344,6 +352,7 @@ INDEX_HTML = """<!doctype html>
     const cleanupRawButton = document.getElementById('cleanupRawButton');
     const gallery = document.getElementById('gallery');
     const historyStatus = document.getElementById('historyStatus');
+    const historyModeInputs = Array.from(document.querySelectorAll('input[name="history_image_mode"]'));
     let selectedFilename = null;
     let generatedFilename = null;
 
@@ -477,7 +486,8 @@ INDEX_HTML = """<!doctype html>
     async function loadHistory() {
       setStatus(historyStatus, 'Loading...');
       try {
-        const result = await api('/api/images');
+        const mode = document.querySelector('input[name="history_image_mode"]:checked')?.value || 'preview';
+        const result = await api('/api/images?mode=' + encodeURIComponent(mode));
         gallery.innerHTML = '';
         for (const image of result.images) {
           const card = document.createElement('article');
@@ -510,6 +520,7 @@ INDEX_HTML = """<!doctype html>
     historyTab.addEventListener('click', () => setTab('history'));
     refreshButton.addEventListener('click', loadHistory);
     cleanupRawButton.addEventListener('click', cleanupRawFiles);
+    historyModeInputs.forEach((input) => input.addEventListener('change', loadHistory));
     loadHistory();
   </script>
 </body>
@@ -647,6 +658,18 @@ def _image_info(path: Path) -> dict:
     }
 
 
+def _history_image_info(path: Path, mode: str) -> dict:
+    info = _image_info(path)
+    if mode == "display":
+        display_path = _display_path_from_name(path.name)
+        if display_path.exists():
+            info["url"] = f"/display-images/{quote(display_path.name)}"
+        else:
+            info["url"] = f"/images/{quote(path.name)}"
+            info["missing_display_file"] = True
+    return info
+
+
 def _parse_upload(content_type: str, body: bytes) -> tuple[str, bytes, str]:
     if not content_type.startswith("multipart/form-data"):
         raise ValueError("Expected multipart/form-data")
@@ -732,9 +755,14 @@ def _store_upload(filename: str, data: bytes, palette_name: str) -> dict:
     with Image.open(BytesIO(data)) as input_image:
         input_image.load()
         prepared = ImageOps.exif_transpose(input_image)
-        preview, display = transform_image_pair(
-            prepared, PALETTES[palette_name], waveshare_e6_ideal
-        )
+        if palette_name == "calibrated":
+            display, preview = transform_image_pair(
+                prepared, waveshare_e6_ideal, waveshare_e6_calibrated
+            )
+        else:
+            preview, display = transform_image_pair(
+                prepared, PALETTES[palette_name], waveshare_e6_ideal
+            )
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     base = f"{timestamp}-{palette_name}-{_safe_filename(filename)}"
@@ -762,12 +790,15 @@ def _store_generated_image(
         image_format = (prepared.format or input_image.format or "png").lower()
         if image_format == "jpeg":
             image_format = "jpg"
-        preview, display = transform_image_pair(
-            prepared,
-            PALETTES[palette_name],
-            waveshare_e6_ideal,
-            target=_target_from_aspect_ratio(aspect_ratio),
-        )
+        target = _target_from_aspect_ratio(aspect_ratio)
+        if palette_name == "calibrated":
+            display, preview = transform_image_pair(
+                prepared, waveshare_e6_ideal, waveshare_e6_calibrated, target=target
+            )
+        else:
+            preview, display = transform_image_pair(
+                prepared, PALETTES[palette_name], waveshare_e6_ideal, target=target
+            )
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     aspect_token = aspect_ratio.replace(":", "x")
@@ -874,9 +905,11 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             self._send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
         elif parsed.path == "/api/images":
-            self._handle_list_images()
+            self._handle_list_images(parsed.query)
         elif parsed.path.startswith("/images/"):
             self._handle_static_image(parsed.path.removeprefix("/images/"))
+        elif parsed.path.startswith("/display-images/"):
+            self._handle_static_display_image(parsed.path.removeprefix("/display-images/"))
         else:
             self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
 
@@ -903,12 +936,15 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:
         logger.info("%s - %s", self.address_string(), fmt % args)
 
-    def _handle_list_images(self) -> None:
+    def _handle_list_images(self, query: str = "") -> None:
         _ensure_dirs()
+        mode = parse_qs(query).get("mode", ["preview"])[0]
+        if mode not in {"preview", "display"}:
+            mode = "preview"
         images = []
         for path in sorted(DITHERED_DIR.glob("*.png"), key=lambda item: item.stat().st_mtime, reverse=True):
             try:
-                images.append(_image_info(path))
+                images.append(_history_image_info(path, mode))
             except (OSError, UnidentifiedImageError):
                 logger.exception("Skipping unreadable image %s", path)
         self._send_json({"images": images})
@@ -916,6 +952,18 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_static_image(self, raw_name: str) -> None:
         try:
             path = _dithered_path_from_name(unquote(raw_name))
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if not path.exists():
+            self._send_json({"error": "Image not found"}, HTTPStatus.NOT_FOUND)
+            return
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        self._send_bytes(path.read_bytes(), content_type)
+
+    def _handle_static_display_image(self, raw_name: str) -> None:
+        try:
+            path = _display_path_from_name(unquote(raw_name))
         except ValueError as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return

@@ -81,12 +81,13 @@ e-ink screen. The generate tab sends a text prompt to the xAI image API using
 `XAI_API_KEY` from the environment or `.env`, then dithers the generated image
 the same way. It also supports style transfer: upload a source image in the
 same form and the server uses xAI style transfer automatically. Choose `2:3`
-for portrait or `3:2` for landscape. The default calibrated palette is used for
-browser previews because it better approximates the physical display, while the
-e-ink screen always receives the corresponding ideal Waveshare colors. The
-history tab lists old dithered images and can send any of them to the screen.
-Deleting an item from history removes the preview image, matching ideal display
-image, and matching original source file from disk.
+for portrait or `3:2` for landscape. The browser preview palette controls how
+the image is shown in the web UI. The default calibrated mode dithers using the
+ideal Waveshare colors, remaps the browser preview to calibrated display colors,
+and sends the ideal-color image to the e-ink screen. The history tab lists old
+dithered images, can toggle between preview and display-file views, and can send
+any of them to the screen. Deleting an item from history removes the preview
+image, matching ideal display image, and matching original source file from disk.
 
 Raw source files in `images_raw/` are cleaned automatically when the server
 starts if they are older than 30 days. The history tab also has a manual cleanup
