@@ -6,7 +6,9 @@ except ImportError:
     from palettes import waveshare_e6_ideal, waveshare_e6_empirical
 
 
-def transform_image(image: Image.Image, palette: list) -> Image.Image:
+def transform_image(
+    image: Image.Image, palette: list, target: tuple[int, int] | None = None
+) -> Image.Image:
     """
     Transforms the input image to match the given palette.
 
@@ -23,11 +25,10 @@ def transform_image(image: Image.Image, palette: list) -> Image.Image:
     if image.mode != "RGB":
         image = image.convert("RGB")
 
-    # Create a new image with 400 x 600 or 600 x 400 dimensions, depending on the aspect ratio of the input image
-    width, height = image.size
-
-    aspect = width / height
-    target = (400, 600) if aspect < 1 else (600, 400)
+    if target is None:
+        width, height = image.size
+        aspect = width / height
+        target = (400, 600) if aspect < 1 else (600, 400)
 
     prepared = ImageOps.fit(
         image, target, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)

@@ -36,6 +36,7 @@ PALETTES = {
 }
 XAI_MODEL = "grok-imagine-image"
 XAI_GENERATIONS_URL = "https://api.x.ai/v1/images/generations"
+XAI_EDITS_URL = "https://api.x.ai/v1/images/edits"
 XAI_ASPECT_RATIOS = {"2:3", "3:2"}
 RAW_CLEANUP_DAYS = 30
 
@@ -259,6 +260,10 @@ INDEX_HTML = """<!doctype html>
           <label for="promptInput">Prompt</label>
           <textarea id="promptInput" name="prompt" required></textarea>
           <div class="field">
+            <label for="generateImageInput">Source Image</label>
+            <input id="generateImageInput" name="image" type="file" accept="image/*">
+          </div>
+          <div class="field">
             <label>Aspect</label>
             <div class="segmented">
               <input id="aspectPortrait" name="aspect_ratio" type="radio" value="2:3" checked>
@@ -444,12 +449,7 @@ INDEX_HTML = """<!doctype html>
       setStatus(generateStatus, 'Generating and dithering...');
       try {
         const formData = new FormData(generateForm);
-        const payload = Object.fromEntries(formData.entries());
-        const result = await api('/api/generate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
+        const result = await api('/api/generate', { method: 'POST', body: formData });
         generatedFilename = result.filename;
         generatePreviewImage.src = result.url + '?t=' + Date.now();
         generatePreviewMeta.innerHTML = `<strong>${escapeHtml(result.filename)}</strong><br>${result.width} x ${result.height}<br>${escapeHtml(result.aspect_ratio)} aspect<br>${escapeHtml(result.palette)} palette<br>${escapeHtml(result.created_at)}`;
@@ -526,6 +526,14 @@ def _safe_filename(filename: str) -> str:
     return stem or "image"
 
 
+def _payload_bytes(payload: object) -> bytes:
+    if isinstance(payload, bytes):
+        return payload
+    if isinstance(payload, str):
+        return payload.encode("utf-8")
+    raise ValueError("Invalid multipart payload")
+
+
 def _load_env_var(name: str) -> str | None:
     value = os.environ.get(name)
     if value:
@@ -552,6 +560,14 @@ def _dithered_path_from_name(filename: str) -> Path:
     if path.suffix.lower() != ".png":
         raise ValueError("Only stored PNG images can be displayed")
     return path
+
+
+def _target_from_aspect_ratio(aspect_ratio: str) -> tuple[int, int]:
+    if aspect_ratio == "2:3":
+        return (400, 600)
+    if aspect_ratio == "3:2":
+        return (600, 400)
+    raise ValueError("Aspect ratio must be 2:3 or 3:2")
 
 
 def _delete_image_files(filename: str) -> dict:
@@ -626,11 +642,11 @@ def _parse_upload(content_type: str, body: bytes) -> tuple[str, bytes, str]:
     for part in message.iter_parts():
         if part.get_content_disposition() == "form-data" and part.get_param("name", header="content-disposition") == "image":
             filename = part.get_filename() or "image"
-            data = part.get_payload(decode=True)
+            data = _payload_bytes(part.get_payload(decode=True))
             if not data:
                 raise ValueError("Uploaded file is empty")
         elif part.get_content_disposition() == "form-data" and part.get_param("name", header="content-disposition") == "palette":
-            payload = part.get_payload(decode=True)
+            payload = _payload_bytes(part.get_payload(decode=True))
             if payload:
                 palette_name = payload.decode("utf-8", errors="ignore").strip().lower()
     if filename is None or data is None:
@@ -638,6 +654,55 @@ def _parse_upload(content_type: str, body: bytes) -> tuple[str, bytes, str]:
     if palette_name not in PALETTES:
         raise ValueError("Unknown palette")
     return filename, data, palette_name
+
+
+def _parse_generate_upload(content_type: str, body: bytes) -> tuple[str, str, str, bytes | None, str]:
+    if not content_type.startswith("multipart/form-data"):
+        raise ValueError("Expected multipart/form-data")
+
+    message = BytesParser(policy=policy.default).parsebytes(
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + body
+    )
+    image_data = None
+    image_content_type = "image/png"
+    prompt = ""
+    palette_name = "ideal"
+    aspect_ratio = "2:3"
+
+    for part in message.iter_parts():
+        if part.get_content_disposition() != "form-data":
+            continue
+        field_name = part.get_param("name", header="content-disposition")
+        if field_name == "image":
+            filename = part.get_filename() or ""
+            if not filename:
+                continue
+            image_data = _payload_bytes(part.get_payload(decode=True))
+            image_content_type = part.get_content_type() or mimetypes.guess_type(filename)[0] or "image/png"
+            if not image_data:
+                raise ValueError("Uploaded file is empty")
+        elif field_name == "prompt":
+            payload = _payload_bytes(part.get_payload(decode=True))
+            if payload:
+                prompt = payload.decode("utf-8", errors="ignore").strip()
+        elif field_name == "palette":
+            payload = _payload_bytes(part.get_payload(decode=True))
+            if payload:
+                palette_name = payload.decode("utf-8", errors="ignore").strip().lower()
+        elif field_name == "aspect_ratio":
+            payload = _payload_bytes(part.get_payload(decode=True))
+            if payload:
+                aspect_ratio = payload.decode("utf-8", errors="ignore").strip()
+
+    if not prompt:
+        raise ValueError("Prompt is required")
+    if palette_name not in PALETTES:
+        raise ValueError("Unknown palette")
+    if aspect_ratio not in XAI_ASPECT_RATIOS:
+        raise ValueError("Aspect ratio must be 2:3 or 3:2")
+    if image_data is not None and not image_content_type.startswith("image/"):
+        raise ValueError("Uploaded file must be an image")
+    return prompt, aspect_ratio, palette_name, image_data, image_content_type
 
 
 def _store_upload(filename: str, data: bytes, palette_name: str) -> dict:
@@ -660,18 +725,26 @@ def _store_upload(filename: str, data: bytes, palette_name: str) -> dict:
     return _image_info(dithered_path) | {"raw_filename": raw_path.name, "palette": palette_name}
 
 
-def _store_generated_image(prompt: str, aspect_ratio: str, palette_name: str, data: bytes) -> dict:
+def _store_generated_image(
+    prompt: str,
+    aspect_ratio: str,
+    palette_name: str,
+    data: bytes,
+    source: str = "xai",
+) -> dict:
     with Image.open(BytesIO(data)) as input_image:
         input_image.load()
         prepared = ImageOps.exif_transpose(input_image)
         image_format = (prepared.format or input_image.format or "png").lower()
         if image_format == "jpeg":
             image_format = "jpg"
-        dithered = transform_image(prepared, PALETTES[palette_name])
+        dithered = transform_image(
+            prepared, PALETTES[palette_name], target=_target_from_aspect_ratio(aspect_ratio)
+        )
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     aspect_token = aspect_ratio.replace(":", "x")
-    base = f"{timestamp}-xai-{aspect_token}-{palette_name}-{_safe_filename(prompt)[:80]}"
+    base = f"{timestamp}-{source}-{aspect_token}-{palette_name}-{_safe_filename(prompt)[:80]}"
     raw_path = RAW_DIR / f"{base}.{image_format}"
     dithered_path = DITHERED_DIR / f"dith_{base}.png"
 
@@ -683,6 +756,17 @@ def _store_generated_image(prompt: str, aspect_ratio: str, palette_name: str, da
         "aspect_ratio": aspect_ratio,
         "prompt": prompt,
     }
+
+
+def _read_xai_image_response(body: bytes) -> bytes:
+    response_payload = json.loads(body)
+    image_data = response_payload.get("data", [{}])[0]
+    if image_data.get("b64_json"):
+        return base64.b64decode(image_data["b64_json"])
+    if image_data.get("url"):
+        with urlopen(image_data["url"], timeout=120) as image_response:
+            return image_response.read()
+    raise RuntimeError("xAI response did not include image data")
 
 
 def _generate_xai_image(prompt: str, aspect_ratio: str) -> bytes:
@@ -711,14 +795,46 @@ def _generate_xai_image(prompt: str, aspect_ratio: str) -> bytes:
     except Exception as exc:
         raise RuntimeError(f"xAI request failed: {exc}") from exc
 
-    response_payload = json.loads(body)
-    image_data = response_payload.get("data", [{}])[0]
-    if image_data.get("b64_json"):
-        return base64.b64decode(image_data["b64_json"])
-    if image_data.get("url"):
-        with urlopen(image_data["url"], timeout=120) as image_response:
-            return image_response.read()
-    raise RuntimeError("xAI response did not include image data")
+    return _read_xai_image_response(body)
+
+
+def _style_transfer_xai_image(
+    source_image: bytes,
+    source_content_type: str,
+    prompt: str,
+    aspect_ratio: str,
+) -> bytes:
+    api_key = _load_env_var("XAI_API_KEY")
+    if not api_key:
+        raise ValueError("Missing XAI_API_KEY in environment or .env")
+
+    encoded_image = base64.b64encode(source_image).decode("ascii")
+    payload = {
+        "model": XAI_MODEL,
+        "prompt": prompt,
+        "aspect_ratio": aspect_ratio,
+        "response_format": "b64_json",
+        "image": {
+            "url": f"data:{source_content_type};base64,{encoded_image}",
+            "type": "image_url",
+        },
+    }
+    request = Request(
+        XAI_EDITS_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=120) as response:
+            body = response.read()
+    except Exception as exc:
+        raise RuntimeError(f"xAI style transfer request failed: {exc}") from exc
+
+    return _read_xai_image_response(body)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -828,18 +944,27 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_generate(self) -> None:
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length) or b"{}")
-            prompt = str(payload.get("prompt", "")).strip()
-            palette_name = str(payload.get("palette", "ideal")).strip().lower()
-            aspect_ratio = str(payload.get("aspect_ratio", "2:3")).strip()
-            if not prompt:
-                raise ValueError("Prompt is required")
-            if palette_name not in PALETTES:
-                raise ValueError("Unknown palette")
-            if aspect_ratio not in XAI_ASPECT_RATIOS:
-                raise ValueError("Aspect ratio must be 2:3 or 3:2")
-            image_bytes = _generate_xai_image(prompt, aspect_ratio)
-            info = _store_generated_image(prompt, aspect_ratio, palette_name, image_bytes)
+        except ValueError:
+            self._send_json({"error": "Invalid Content-Length"}, HTTPStatus.BAD_REQUEST)
+            return
+        if length <= 0:
+            self._send_json({"error": "Upload body is empty"}, HTTPStatus.BAD_REQUEST)
+            return
+        if length > MAX_UPLOAD_BYTES:
+            self._send_json({"error": "Upload is too large"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            return
+
+        try:
+            prompt, aspect_ratio, palette_name, source_data, content_type = _parse_generate_upload(
+                self.headers.get("Content-Type", ""), self.rfile.read(length)
+            )
+            if source_data is None:
+                image_bytes = _generate_xai_image(prompt, aspect_ratio)
+                source = "xai"
+            else:
+                image_bytes = _style_transfer_xai_image(source_data, content_type, prompt, aspect_ratio)
+                source = "xai-style"
+            info = _store_generated_image(prompt, aspect_ratio, palette_name, image_bytes, source=source)
         except ValueError as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return

@@ -77,11 +77,13 @@ Open `http://<pi-address>:8000/`. The upload tab stores the original image in
 Floyd-Steinberg dithers it to the selected six-color palette, and stores the
 display image in `images/`. The generate tab sends a text prompt to the xAI
 image API using `XAI_API_KEY` from the environment or `.env`, then dithers the
-generated image the same way. Choose `2:3` for portrait or `3:2` for landscape.
-The empirical palette uses measured display-like colors; the default ideal
-palette uses full RGB primaries. The history tab lists old dithered images and
-can send any of them to the screen. Deleting an item from history removes the
-dithered image and the matching original source file from disk.
+generated image the same way. It also supports style transfer: upload a source
+image in the same form and the server uses xAI style transfer automatically.
+Choose `2:3` for portrait or `3:2` for landscape. The empirical palette uses
+measured display-like colors; the default ideal palette uses full RGB primaries.
+The history tab lists old dithered images and can send any of them to the
+screen. Deleting an item from history removes the dithered image and the
+matching original source file from disk.
 
 Raw source files in `images_raw/` are cleaned automatically when the server
 starts if they are older than 30 days. The history tab also has a manual cleanup
