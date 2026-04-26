@@ -11,6 +11,8 @@ wheels/
 
 # Local secrets
 .env
-.env
+
+# Runtime image storage
 images/*
 images_raw/*
+images_display/*

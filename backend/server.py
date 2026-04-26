@@ -23,14 +23,20 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from backend.eink_display import display_image_on_eink
-from backend.image_transform.palettes import waveshare_e6_empirical, waveshare_e6_ideal
-from backend.image_transform.transform_image import transform_image
+from backend.image_transform.palettes import (
+    waveshare_e6_calibrated,
+    waveshare_e6_empirical,
+    waveshare_e6_ideal,
+)
+from backend.image_transform.transform_image import transform_image_pair
 
 RAW_DIR = ROOT_DIR / "images_raw"
 DITHERED_DIR = ROOT_DIR / "images"
+DISPLAY_DIR = ROOT_DIR / "images_display"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp", ".tif", ".tiff"}
 PALETTES = {
+    "calibrated": waveshare_e6_calibrated,
     "empirical": waveshare_e6_empirical,
     "ideal": waveshare_e6_ideal,
 }
@@ -229,9 +235,9 @@ INDEX_HTML = """<!doctype html>
           <div class="field">
             <label>Palette</label>
             <div class="segmented">
-              <input id="paletteEmpirical" name="palette" type="radio" value="empirical">
-              <label for="paletteEmpirical">Empirical</label>
-              <input id="paletteIdeal" name="palette" type="radio" value="ideal" checked>
+              <input id="paletteCalibrated" name="palette" type="radio" value="calibrated" checked>
+              <label for="paletteCalibrated">Calibrated</label>
+              <input id="paletteIdeal" name="palette" type="radio" value="ideal">
               <label for="paletteIdeal">Ideal</label>
             </div>
           </div>
@@ -275,9 +281,9 @@ INDEX_HTML = """<!doctype html>
           <div class="field">
             <label>Palette</label>
             <div class="segmented">
-              <input id="generatePaletteEmpirical" name="palette" type="radio" value="empirical">
-              <label for="generatePaletteEmpirical">Empirical</label>
-              <input id="generatePaletteIdeal" name="palette" type="radio" value="ideal" checked>
+              <input id="generatePaletteCalibrated" name="palette" type="radio" value="calibrated" checked>
+              <label for="generatePaletteCalibrated">Calibrated</label>
+              <input id="generatePaletteIdeal" name="palette" type="radio" value="ideal">
               <label for="generatePaletteIdeal">Ideal</label>
             </div>
           </div>
@@ -514,6 +520,7 @@ INDEX_HTML = """<!doctype html>
 def _ensure_dirs() -> None:
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     DITHERED_DIR.mkdir(parents=True, exist_ok=True)
+    DISPLAY_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _json_bytes(payload: object) -> bytes:
@@ -562,6 +569,16 @@ def _dithered_path_from_name(filename: str) -> Path:
     return path
 
 
+def _display_path_from_name(filename: str) -> Path:
+    clean = Path(filename).name
+    path = (DISPLAY_DIR / clean).resolve()
+    if path.parent != DISPLAY_DIR.resolve():
+        raise ValueError("Invalid filename")
+    if path.suffix.lower() != ".png":
+        raise ValueError("Only stored PNG images can be displayed")
+    return path
+
+
 def _target_from_aspect_ratio(aspect_ratio: str) -> tuple[int, int]:
     if aspect_ratio == "2:3":
         return (400, 600)
@@ -578,16 +595,17 @@ def _delete_image_files(filename: str) -> dict:
     deleted = []
     dithered_stem = dithered_path.stem
     raw_stem = dithered_stem.removeprefix("dith_")
+    display_path = _display_path_from_name(dithered_path.name)
     raw_candidates = [
         path
         for path in RAW_DIR.iterdir()
         if path.is_file() and path.stem == raw_stem
     ]
 
-    for path in [dithered_path, *raw_candidates]:
+    for path in [dithered_path, display_path, *raw_candidates]:
         try:
             path.unlink()
-            deleted.append(path.name)
+            deleted.append(str(path.relative_to(ROOT_DIR)))
         except FileNotFoundError:
             pass
 
@@ -638,7 +656,7 @@ def _parse_upload(content_type: str, body: bytes) -> tuple[str, bytes, str]:
     )
     filename = None
     data = None
-    palette_name = "ideal"
+    palette_name = "calibrated"
     for part in message.iter_parts():
         if part.get_content_disposition() == "form-data" and part.get_param("name", header="content-disposition") == "image":
             filename = part.get_filename() or "image"
@@ -666,7 +684,7 @@ def _parse_generate_upload(content_type: str, body: bytes) -> tuple[str, str, st
     image_data = None
     image_content_type = "image/png"
     prompt = ""
-    palette_name = "ideal"
+    palette_name = "calibrated"
     aspect_ratio = "2:3"
 
     for part in message.iter_parts():
@@ -706,6 +724,7 @@ def _parse_generate_upload(content_type: str, body: bytes) -> tuple[str, str, st
 
 
 def _store_upload(filename: str, data: bytes, palette_name: str) -> dict:
+    _ensure_dirs()
     extension = Path(filename).suffix.lower()
     if extension not in ALLOWED_EXTENSIONS:
         extension = ".png"
@@ -713,15 +732,19 @@ def _store_upload(filename: str, data: bytes, palette_name: str) -> dict:
     with Image.open(BytesIO(data)) as input_image:
         input_image.load()
         prepared = ImageOps.exif_transpose(input_image)
-        dithered = transform_image(prepared, PALETTES[palette_name])
+        preview, display = transform_image_pair(
+            prepared, PALETTES[palette_name], waveshare_e6_ideal
+        )
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     base = f"{timestamp}-{palette_name}-{_safe_filename(filename)}"
     raw_path = RAW_DIR / f"{base}{extension}"
     dithered_path = DITHERED_DIR / f"dith_{base}.png"
+    display_path = DISPLAY_DIR / dithered_path.name
 
     raw_path.write_bytes(data)
-    dithered.save(dithered_path)
+    preview.save(dithered_path)
+    display.save(display_path)
     return _image_info(dithered_path) | {"raw_filename": raw_path.name, "palette": palette_name}
 
 
@@ -732,14 +755,18 @@ def _store_generated_image(
     data: bytes,
     source: str = "xai",
 ) -> dict:
+    _ensure_dirs()
     with Image.open(BytesIO(data)) as input_image:
         input_image.load()
         prepared = ImageOps.exif_transpose(input_image)
         image_format = (prepared.format or input_image.format or "png").lower()
         if image_format == "jpeg":
             image_format = "jpg"
-        dithered = transform_image(
-            prepared, PALETTES[palette_name], target=_target_from_aspect_ratio(aspect_ratio)
+        preview, display = transform_image_pair(
+            prepared,
+            PALETTES[palette_name],
+            waveshare_e6_ideal,
+            target=_target_from_aspect_ratio(aspect_ratio),
         )
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -747,9 +774,11 @@ def _store_generated_image(
     base = f"{timestamp}-{source}-{aspect_token}-{palette_name}-{_safe_filename(prompt)[:80]}"
     raw_path = RAW_DIR / f"{base}.{image_format}"
     dithered_path = DITHERED_DIR / f"dith_{base}.png"
+    display_path = DISPLAY_DIR / dithered_path.name
 
     raw_path.write_bytes(data)
-    dithered.save(dithered_path)
+    preview.save(dithered_path)
+    display.save(display_path)
     return _image_info(dithered_path) | {
         "raw_filename": raw_path.name,
         "palette": palette_name,
@@ -982,7 +1011,8 @@ class Handler(BaseHTTPRequestHandler):
             if not path.exists():
                 self._send_json({"error": "Image not found"}, HTTPStatus.NOT_FOUND)
                 return
-            display_image_on_eink(path)
+            display_path = _display_path_from_name(path.name)
+            display_image_on_eink(display_path if display_path.exists() else path)
         except ValueError as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return

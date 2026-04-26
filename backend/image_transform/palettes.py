@@ -15,3 +15,12 @@ waveshare_e6_empirical = [
     (0, 53, 214),  # blue
     (251, 246, 0),  # yellow
 ]
+
+waveshare_e6_calibrated = [
+    (31, 34, 38),  # black
+    (185, 199, 201),  # white
+    (98, 32, 30),  # red
+    (53, 86, 58),  # green
+    (35, 63, 142),  # blue
+    (193, 187, 30),  # yellow
+]
