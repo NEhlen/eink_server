@@ -5,6 +5,7 @@ import mimetypes
 import os
 import re
 import sys
+import threading
 import time
 from datetime import datetime
 from email import policy
@@ -13,6 +14,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
@@ -33,6 +35,7 @@ from backend.image_transform.transform_image import transform_image_pair
 RAW_DIR = ROOT_DIR / "images_raw"
 DITHERED_DIR = ROOT_DIR / "images"
 DISPLAY_DIR = ROOT_DIR / "images_display"
+FAVORITES_PATH = ROOT_DIR / "image_favorites.json"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp", ".tif", ".tiff"}
 PALETTES = {
@@ -40,12 +43,14 @@ PALETTES = {
     "empirical": waveshare_e6_empirical,
     "ideal": waveshare_e6_ideal,
 }
-XAI_MODEL = "grok-imagine-image"
+DEFAULT_XAI_IMAGE_MODEL = "grok-imagine-image"
+XAI_IMAGE_MODELS = {"grok-imagine-image", "grok-imagine-image-pro"}
 XAI_GENERATIONS_URL = "https://api.x.ai/v1/images/generations"
 XAI_EDITS_URL = "https://api.x.ai/v1/images/edits"
 XAI_ASPECT_RATIOS = {"2:3", "3:2"}
 RAW_CLEANUP_DAYS = 30
 BOOST_MODES = {"off", "mild"}
+FAVORITES_LOCK = threading.RLock()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -203,6 +208,7 @@ INDEX_HTML = """<!doctype html>
       padding: 10px;
       background: white;
     }
+    .thumb.favorite { border-color: var(--accent); }
     .thumb-title {
       font-size: 13px;
       font-weight: 700;
@@ -225,6 +231,7 @@ INDEX_HTML = """<!doctype html>
     <div class="tabs" role="tablist">
       <button class="tab active" id="uploadTab" type="button">Upload</button>
       <button class="tab" id="generateTab" type="button">Generate</button>
+      <button class="tab" id="favoritesTab" type="button">Favorites</button>
       <button class="tab" id="historyTab" type="button">History</button>
     </div>
 
@@ -280,6 +287,15 @@ INDEX_HTML = """<!doctype html>
             <input id="generateImageInput" name="image" type="file" accept="image/*">
           </div>
           <div class="field">
+            <label>Image Model</label>
+            <div class="segmented">
+              <input id="generateModelStandard" name="model" type="radio" value="grok-imagine-image" checked>
+              <label for="generateModelStandard">Standard</label>
+              <input id="generateModelPro" name="model" type="radio" value="grok-imagine-image-pro">
+              <label for="generateModelPro">Pro</label>
+            </div>
+          </div>
+          <div class="field">
             <label>Aspect</label>
             <div class="segmented">
               <input id="aspectPortrait" name="aspect_ratio" type="radio" value="2:3" checked>
@@ -325,6 +341,22 @@ INDEX_HTML = """<!doctype html>
       </div>
     </section>
 
+    <section class="panel hidden" id="favoritesPanel">
+      <div class="history-tools">
+        <div class="meta">Favorite images are stored in the local favorites list and remain available until deleted.</div>
+        <div class="actions">
+          <div class="segmented">
+            <input id="favoritesPreviewMode" name="favorites_image_mode" type="radio" value="preview" checked>
+            <label for="favoritesPreviewMode">Preview</label>
+            <input id="favoritesDisplayMode" name="favorites_image_mode" type="radio" value="display">
+            <label for="favoritesDisplayMode">Display</label>
+          </div>
+        </div>
+      </div>
+      <div class="gallery" id="favoritesGallery"></div>
+      <div class="status" id="favoritesStatus"></div>
+    </section>
+
     <section class="panel hidden" id="historyPanel">
       <div class="history-tools">
         <div class="meta">Raw source files older than 30 days can be removed without deleting dithered images.</div>
@@ -345,9 +377,11 @@ INDEX_HTML = """<!doctype html>
   <script>
     const uploadTab = document.getElementById('uploadTab');
     const generateTab = document.getElementById('generateTab');
+    const favoritesTab = document.getElementById('favoritesTab');
     const historyTab = document.getElementById('historyTab');
     const uploadPanel = document.getElementById('uploadPanel');
     const generatePanel = document.getElementById('generatePanel');
+    const favoritesPanel = document.getElementById('favoritesPanel');
     const historyPanel = document.getElementById('historyPanel');
     const uploadForm = document.getElementById('uploadForm');
     const uploadButton = document.getElementById('uploadButton');
@@ -369,21 +403,30 @@ INDEX_HTML = """<!doctype html>
     const generateDisplayStatus = document.getElementById('generateDisplayStatus');
     const refreshButton = document.getElementById('refreshButton');
     const cleanupRawButton = document.getElementById('cleanupRawButton');
+    const favoritesGallery = document.getElementById('favoritesGallery');
+    const favoritesStatus = document.getElementById('favoritesStatus');
     const gallery = document.getElementById('gallery');
     const historyStatus = document.getElementById('historyStatus');
     const historyModeInputs = Array.from(document.querySelectorAll('input[name="history_image_mode"]'));
+    const favoritesModeInputs = Array.from(document.querySelectorAll('input[name="favorites_image_mode"]'));
     let selectedFilename = null;
     let generatedFilename = null;
+    let activeTab = 'upload';
 
     function setTab(name) {
+      activeTab = name;
       const history = name === 'history';
+      const favorites = name === 'favorites';
       const generate = name === 'generate';
-      uploadTab.classList.toggle('active', !history && !generate);
+      uploadTab.classList.toggle('active', !history && !favorites && !generate);
       generateTab.classList.toggle('active', generate);
+      favoritesTab.classList.toggle('active', favorites);
       historyTab.classList.toggle('active', history);
-      uploadPanel.classList.toggle('hidden', history || generate);
+      uploadPanel.classList.toggle('hidden', history || favorites || generate);
       generatePanel.classList.toggle('hidden', !generate);
+      favoritesPanel.classList.toggle('hidden', !favorites);
       historyPanel.classList.toggle('hidden', !history);
+      if (favorites) loadFavorites();
       if (history) loadHistory();
     }
 
@@ -446,14 +489,29 @@ INDEX_HTML = """<!doctype html>
       }
     }
 
-    async function deleteImage(filename, statusNode, card, button) {
+    async function deleteImage(filename, statusNode, button) {
       if (!confirm('Delete this image and its source file?')) return;
       button.disabled = true;
       setStatus(statusNode, 'Deleting...');
       try {
         await api('/api/images/' + encodeURIComponent(filename), { method: 'DELETE' });
-        card.remove();
-        setStatus(historyStatus, gallery.children.length ? '' : 'No dithered images yet.');
+        await loadCurrentImageTab();
+      } catch (error) {
+        setStatus(statusNode, error.message, true);
+        button.disabled = false;
+      }
+    }
+
+    async function setFavorite(filename, favorite, statusNode, button) {
+      button.disabled = true;
+      setStatus(statusNode, favorite ? 'Adding favorite...' : 'Removing favorite...');
+      try {
+        await api('/api/images/' + encodeURIComponent(filename) + '/favorite', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ favorite })
+        });
+        await loadCurrentImageTab();
       } catch (error) {
         setStatus(statusNode, error.message, true);
         button.disabled = false;
@@ -486,11 +544,11 @@ INDEX_HTML = """<!doctype html>
         const result = await api('/api/generate', { method: 'POST', body: formData });
         generatedFilename = result.filename;
         generatePreviewImage.src = result.url + '?t=' + Date.now();
-        generatePreviewMeta.innerHTML = `<strong>${escapeHtml(result.filename)}</strong><br>${result.width} x ${result.height}<br>${escapeHtml(result.aspect_ratio)} aspect<br>${escapeHtml(result.palette)} palette<br>${escapeHtml(result.boost)} boost<br>${escapeHtml(result.created_at)}`;
+        generatePreviewMeta.innerHTML = `<strong>${escapeHtml(result.filename)}</strong><br>${result.width} x ${result.height}<br>${escapeHtml(result.aspect_ratio)} aspect<br>${escapeHtml(result.model)} model<br>${escapeHtml(result.palette)} palette<br>${escapeHtml(result.boost)} boost<br>${escapeHtml(result.created_at)}`;
         generatePreview.classList.remove('hidden');
         generatePreviewEmpty.classList.add('hidden');
         setStatus(generateStatus, 'Ready to send.');
-        await loadHistory();
+        await loadCurrentImageTab();
       } catch (error) {
         setStatus(generateStatus, error.message, true);
       } finally {
@@ -502,45 +560,71 @@ INDEX_HTML = """<!doctype html>
       if (generatedFilename) displayImage(generatedFilename, generateDisplayStatus, displayGeneratedButton);
     });
 
-    async function loadHistory() {
-      setStatus(historyStatus, 'Loading...');
+    function renderImageCard(image) {
+      const card = document.createElement('article');
+      card.className = image.favorite ? 'thumb favorite' : 'thumb';
+      card.innerHTML = `
+        <img src="${escapeHtml(image.url)}" alt="${escapeHtml(image.filename)}">
+        <div class="thumb-title">${escapeHtml(image.filename)}</div>
+        <div class="meta">${image.width} x ${image.height}<br>${escapeHtml(image.created_at)}</div>
+        <div class="actions">
+          <button type="button" data-action="display">Send to Screen</button>
+          <button class="secondary" type="button" data-action="favorite">${image.favorite ? 'Unfavorite' : 'Favorite'}</button>
+          <button class="danger" type="button" data-action="delete">Delete</button>
+        </div>
+        <div class="status"></div>
+      `;
+      const button = card.querySelector('[data-action="display"]');
+      const favoriteButton = card.querySelector('[data-action="favorite"]');
+      const deleteButton = card.querySelector('[data-action="delete"]');
+      const status = card.querySelector('.status');
+      button.addEventListener('click', () => displayImage(image.filename, status, button));
+      favoriteButton.addEventListener('click', () => setFavorite(image.filename, !image.favorite, status, favoriteButton));
+      deleteButton.addEventListener('click', () => deleteImage(image.filename, status, deleteButton));
+      return card;
+    }
+
+    async function loadImageGallery({ mode, galleryNode, statusNode, favoritesOnly = false }) {
+      setStatus(statusNode, 'Loading...');
       try {
-        const mode = document.querySelector('input[name="history_image_mode"]:checked')?.value || 'preview';
         const result = await api('/api/images?mode=' + encodeURIComponent(mode));
-        gallery.innerHTML = '';
-        for (const image of result.images) {
-          const card = document.createElement('article');
-          card.className = 'thumb';
-          card.innerHTML = `
-            <img src="${escapeHtml(image.url)}" alt="${escapeHtml(image.filename)}">
-            <div class="thumb-title">${escapeHtml(image.filename)}</div>
-            <div class="meta">${image.width} x ${image.height}<br>${escapeHtml(image.created_at)}</div>
-            <div class="actions">
-              <button type="button" data-action="display">Send to Screen</button>
-              <button class="danger" type="button" data-action="delete">Delete</button>
-            </div>
-            <div class="status"></div>
-          `;
-          const button = card.querySelector('[data-action="display"]');
-          const deleteButton = card.querySelector('[data-action="delete"]');
-          const status = card.querySelector('.status');
-          button.addEventListener('click', () => displayImage(image.filename, status, button));
-          deleteButton.addEventListener('click', () => deleteImage(image.filename, status, card, deleteButton));
-          gallery.appendChild(card);
+        const images = favoritesOnly ? result.images.filter((image) => image.favorite) : result.images;
+        galleryNode.innerHTML = '';
+        for (const image of images) {
+          galleryNode.appendChild(renderImageCard(image));
         }
-        setStatus(historyStatus, result.images.length ? '' : 'No dithered images yet.');
+        setStatus(statusNode, images.length ? '' : favoritesOnly ? 'No favorite images yet.' : 'No dithered images yet.');
       } catch (error) {
-        setStatus(historyStatus, error.message, true);
+        setStatus(statusNode, error.message, true);
+      }
+    }
+
+    async function loadFavorites() {
+      const mode = document.querySelector('input[name="favorites_image_mode"]:checked')?.value || 'preview';
+      await loadImageGallery({ mode, galleryNode: favoritesGallery, statusNode: favoritesStatus, favoritesOnly: true });
+    }
+
+    async function loadHistory() {
+      const mode = document.querySelector('input[name="history_image_mode"]:checked')?.value || 'preview';
+      await loadImageGallery({ mode, galleryNode: gallery, statusNode: historyStatus });
+    }
+
+    async function loadCurrentImageTab() {
+      if (activeTab === 'favorites') {
+        await loadFavorites();
+      } else if (activeTab === 'history') {
+        await loadHistory();
       }
     }
 
     uploadTab.addEventListener('click', () => setTab('upload'));
     generateTab.addEventListener('click', () => setTab('generate'));
+    favoritesTab.addEventListener('click', () => setTab('favorites'));
     historyTab.addEventListener('click', () => setTab('history'));
-    refreshButton.addEventListener('click', loadHistory);
+    refreshButton.addEventListener('click', loadCurrentImageTab);
     cleanupRawButton.addEventListener('click', cleanupRawFiles);
     historyModeInputs.forEach((input) => input.addEventListener('change', loadHistory));
-    loadHistory();
+    favoritesModeInputs.forEach((input) => input.addEventListener('change', loadFavorites));
   </script>
 </body>
 </html>
@@ -609,6 +693,55 @@ def _display_path_from_name(filename: str) -> Path:
     return path
 
 
+def _normalize_favorite_name(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    clean = Path(value).name
+    if not clean or clean != value or Path(clean).suffix.lower() != ".png":
+        return None
+    return clean
+
+
+def _load_favorites() -> set[str]:
+    with FAVORITES_LOCK:
+        try:
+            payload = json.loads(FAVORITES_PATH.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return set()
+        except (OSError, json.JSONDecodeError):
+            logger.exception("Could not read favorites metadata")
+            return set()
+        if not isinstance(payload, list):
+            return set()
+        return {
+            name
+            for item in payload
+            if (name := _normalize_favorite_name(item)) is not None
+        }
+
+
+def _save_favorites(favorites: set[str]) -> None:
+    with FAVORITES_LOCK:
+        FAVORITES_PATH.write_text(
+            json.dumps(sorted(favorites), indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+
+def _set_image_favorite(filename: str, favorite: bool) -> dict:
+    path = _dithered_path_from_name(filename)
+    if not path.exists():
+        raise FileNotFoundError("Image not found")
+    with FAVORITES_LOCK:
+        favorites = _load_favorites()
+        if favorite:
+            favorites.add(path.name)
+        else:
+            favorites.discard(path.name)
+        _save_favorites(favorites)
+    return {"filename": path.name, "favorite": path.name in favorites}
+
+
 def _target_from_aspect_ratio(aspect_ratio: str) -> tuple[int, int]:
     if aspect_ratio == "2:3":
         return (400, 600)
@@ -638,6 +771,12 @@ def _delete_image_files(filename: str) -> dict:
             deleted.append(str(path.relative_to(ROOT_DIR)))
         except FileNotFoundError:
             pass
+
+    with FAVORITES_LOCK:
+        favorites = _load_favorites()
+        if dithered_path.name in favorites:
+            favorites.discard(dithered_path.name)
+            _save_favorites(favorites)
 
     return {"deleted": deleted}
 
@@ -677,8 +816,9 @@ def _image_info(path: Path) -> dict:
     }
 
 
-def _history_image_info(path: Path, mode: str) -> dict:
+def _history_image_info(path: Path, mode: str, favorites: set[str]) -> dict:
     info = _image_info(path)
+    info["favorite"] = path.name in favorites
     if mode == "display":
         display_path = _display_path_from_name(path.name)
         if display_path.exists():
@@ -723,7 +863,7 @@ def _parse_upload(content_type: str, body: bytes) -> tuple[str, bytes, str, str]
     return filename, data, palette_name, boost
 
 
-def _parse_generate_upload(content_type: str, body: bytes) -> tuple[str, str, str, str, bytes | None, str]:
+def _parse_generate_upload(content_type: str, body: bytes) -> tuple[str, str, str, str, str, bytes | None, str]:
     if not content_type.startswith("multipart/form-data"):
         raise ValueError("Expected multipart/form-data")
 
@@ -736,6 +876,7 @@ def _parse_generate_upload(content_type: str, body: bytes) -> tuple[str, str, st
     palette_name = "calibrated"
     aspect_ratio = "2:3"
     boost = "off"
+    model = DEFAULT_XAI_IMAGE_MODEL
 
     for part in message.iter_parts():
         if part.get_content_disposition() != "form-data":
@@ -765,6 +906,10 @@ def _parse_generate_upload(content_type: str, body: bytes) -> tuple[str, str, st
             payload = _payload_bytes(part.get_payload(decode=True))
             if payload:
                 boost = payload.decode("utf-8", errors="ignore").strip().lower()
+        elif field_name == "model":
+            payload = _payload_bytes(part.get_payload(decode=True))
+            if payload:
+                model = payload.decode("utf-8", errors="ignore").strip()
 
     if not prompt:
         raise ValueError("Prompt is required")
@@ -774,9 +919,11 @@ def _parse_generate_upload(content_type: str, body: bytes) -> tuple[str, str, st
         raise ValueError("Aspect ratio must be 2:3 or 3:2")
     if boost not in BOOST_MODES:
         raise ValueError("Unknown boost mode")
+    if model not in XAI_IMAGE_MODELS:
+        raise ValueError("Unknown xAI image model")
     if image_data is not None and not image_content_type.startswith("image/"):
         raise ValueError("Uploaded file must be an image")
-    return prompt, aspect_ratio, palette_name, boost, image_data, image_content_type
+    return prompt, aspect_ratio, palette_name, boost, model, image_data, image_content_type
 
 
 def _store_upload(filename: str, data: bytes, palette_name: str, boost: str = "off") -> dict:
@@ -818,6 +965,7 @@ def _store_generated_image(
     aspect_ratio: str,
     palette_name: str,
     data: bytes,
+    model: str,
     source: str = "xai",
     boost: str = "off",
 ) -> dict:
@@ -861,6 +1009,7 @@ def _store_generated_image(
         "palette": palette_name,
         "boost": boost,
         "aspect_ratio": aspect_ratio,
+        "model": model,
         "prompt": prompt,
     }
 
@@ -876,14 +1025,39 @@ def _read_xai_image_response(body: bytes) -> bytes:
     raise RuntimeError("xAI response did not include image data")
 
 
-def _generate_xai_image(prompt: str, aspect_ratio: str) -> bytes:
+def _read_xai_error(exc: HTTPError) -> str:
+    try:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        body = ""
+    if not body:
+        return f"HTTP {exc.code} {exc.reason}"
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return f"HTTP {exc.code} {exc.reason}: {body[:500]}"
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("code") or error.get("type")
+        if message:
+            return f"HTTP {exc.code} {exc.reason}: {message}"
+    if isinstance(error, str):
+        return f"HTTP {exc.code} {exc.reason}: {error}"
+    message = payload.get("message")
+    if isinstance(message, str):
+        return f"HTTP {exc.code} {exc.reason}: {message}"
+    return f"HTTP {exc.code} {exc.reason}: {body[:500]}"
+
+
+def _generate_xai_image(prompt: str, aspect_ratio: str, model: str) -> bytes:
     api_key = _load_env_var("XAI_API_KEY")
     if not api_key:
         raise ValueError("Missing XAI_API_KEY in environment or .env")
 
     payload = {
-        "model": XAI_MODEL,
+        "model": model,
         "prompt": prompt,
+        "n": 1,
         "aspect_ratio": aspect_ratio,
         "response_format": "b64_json",
     }
@@ -899,6 +1073,8 @@ def _generate_xai_image(prompt: str, aspect_ratio: str) -> bytes:
     try:
         with urlopen(request, timeout=120) as response:
             body = response.read()
+    except HTTPError as exc:
+        raise RuntimeError(f"xAI request failed: {_read_xai_error(exc)}") from exc
     except Exception as exc:
         raise RuntimeError(f"xAI request failed: {exc}") from exc
 
@@ -910,6 +1086,7 @@ def _style_transfer_xai_image(
     source_content_type: str,
     prompt: str,
     aspect_ratio: str,
+    model: str,
 ) -> bytes:
     api_key = _load_env_var("XAI_API_KEY")
     if not api_key:
@@ -917,8 +1094,9 @@ def _style_transfer_xai_image(
 
     encoded_image = base64.b64encode(source_image).decode("ascii")
     payload = {
-        "model": XAI_MODEL,
+        "model": model,
         "prompt": prompt,
+        "n": 1,
         "aspect_ratio": aspect_ratio,
         "response_format": "b64_json",
         "image": {
@@ -938,6 +1116,8 @@ def _style_transfer_xai_image(
     try:
         with urlopen(request, timeout=120) as response:
             body = response.read()
+    except HTTPError as exc:
+        raise RuntimeError(f"xAI style transfer request failed: {_read_xai_error(exc)}") from exc
     except Exception as exc:
         raise RuntimeError(f"xAI style transfer request failed: {exc}") from exc
 
@@ -970,6 +1150,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_cleanup_raw()
         elif parsed.path == "/api/display":
             self._handle_display()
+        elif parsed.path.startswith("/api/images/") and parsed.path.endswith("/favorite"):
+            self._handle_favorite_image(parsed.path.removeprefix("/api/images/").removesuffix("/favorite"))
         else:
             self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
 
@@ -989,9 +1171,10 @@ class Handler(BaseHTTPRequestHandler):
         if mode not in {"preview", "display"}:
             mode = "preview"
         images = []
+        favorites = _load_favorites()
         for path in sorted(DITHERED_DIR.glob("*.png"), key=lambda item: item.stat().st_mtime, reverse=True):
             try:
-                images.append(_history_image_info(path, mode))
+                images.append(_history_image_info(path, mode, favorites))
             except (OSError, UnidentifiedImageError):
                 logger.exception("Skipping unreadable image %s", path)
         self._send_json({"images": images})
@@ -1032,6 +1215,26 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as exc:
             logger.exception("Delete failed")
             self._send_json({"error": f"Delete failed: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        self._send_json(result)
+
+    def _handle_favorite_image(self, raw_name: str) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            favorite = payload.get("favorite")
+            if not isinstance(favorite, bool):
+                raise ValueError("Favorite must be true or false")
+            result = _set_image_favorite(unquote(raw_name), favorite)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            return
+        except OSError as exc:
+            logger.exception("Favorite update failed")
+            self._send_json({"error": f"Favorite update failed: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
         self._send_json(result)
 
@@ -1081,17 +1284,17 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            prompt, aspect_ratio, palette_name, boost, source_data, content_type = _parse_generate_upload(
+            prompt, aspect_ratio, palette_name, boost, model, source_data, content_type = _parse_generate_upload(
                 self.headers.get("Content-Type", ""), self.rfile.read(length)
             )
             if source_data is None:
-                image_bytes = _generate_xai_image(prompt, aspect_ratio)
-                source = "xai"
+                image_bytes = _generate_xai_image(prompt, aspect_ratio, model)
+                source = "xai-pro" if model.endswith("-pro") else "xai"
             else:
-                image_bytes = _style_transfer_xai_image(source_data, content_type, prompt, aspect_ratio)
-                source = "xai-style"
+                image_bytes = _style_transfer_xai_image(source_data, content_type, prompt, aspect_ratio, model)
+                source = "xai-style-pro" if model.endswith("-pro") else "xai-style"
             info = _store_generated_image(
-                prompt, aspect_ratio, palette_name, image_bytes, source=source, boost=boost
+                prompt, aspect_ratio, palette_name, image_bytes, model, source=source, boost=boost
             )
         except ValueError as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)

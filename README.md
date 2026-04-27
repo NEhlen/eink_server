@@ -79,17 +79,21 @@ preview image in `images/`. For each preview, the server also stores a matching
 ideal-color display image in `images_display/`; this is the file sent to the
 e-ink screen. The generate tab sends a text prompt to the xAI image API using
 `XAI_API_KEY` from the environment or `.env`, then dithers the generated image
-the same way. It also supports style transfer: upload a source image in the
-same form and the server uses xAI style transfer automatically. Choose `2:3`
-for portrait or `3:2` for landscape. The browser preview palette controls how
+the same way. The default image model is `grok-imagine-image`; the generate tab
+can switch to `grok-imagine-image-pro` for individual requests. It also supports
+style transfer: upload a source image in the same form and the server uses xAI
+style transfer automatically. Choose `2:3` for portrait or `3:2` for landscape.
+The browser preview palette controls how
 the image is shown in the web UI. The default calibrated mode dithers using the
 ideal Waveshare colors, remaps the browser preview to calibrated display colors,
 and sends the ideal-color image to the e-ink screen. The optional mild boost
 adds a small contrast, saturation, and sharpness increase before dithering. The
-history tab lists old dithered images, can toggle between preview and
-display-file views, and can send any of them to the screen. Deleting an item
-from history removes the preview image, matching ideal display image, and
-matching original source file from disk.
+favorites tab lists marked images. The history tab lists all old dithered
+images. Both tabs can toggle between preview and display-file views, can mark or
+unmark favorites, and can send any image to the screen. Favorites are stored in
+the local `image_favorites.json` runtime file. Deleting an item removes the
+preview image, matching ideal display image, matching original source file, and
+any favorite marker from disk.
 
 Raw source files in `images_raw/` are cleaned automatically when the server
 starts if they are older than 30 days. The history tab also has a manual cleanup
