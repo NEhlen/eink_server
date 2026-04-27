@@ -502,18 +502,27 @@ INDEX_HTML = """<!doctype html>
       }
     }
 
-    async function setFavorite(filename, favorite, statusNode, button) {
+    async function setFavorite(filename, favorite, statusNode, button, card) {
       button.disabled = true;
       setStatus(statusNode, favorite ? 'Adding favorite...' : 'Removing favorite...');
       try {
-        await api('/api/images/' + encodeURIComponent(filename) + '/favorite', {
+        const result = await api('/api/images/' + encodeURIComponent(filename) + '/favorite', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ favorite })
         });
-        await loadCurrentImageTab();
+        card.dataset.favorite = result.favorite ? 'true' : 'false';
+        card.classList.toggle('favorite', result.favorite);
+        button.textContent = result.favorite ? 'Unfavorite' : 'Favorite';
+        button.dataset.favorite = result.favorite ? 'true' : 'false';
+        setStatus(statusNode, result.favorite ? 'Added to favorites.' : 'Removed from favorites.');
+        if (activeTab === 'favorites' && !result.favorite) {
+          card.remove();
+          setStatus(favoritesStatus, favoritesGallery.children.length ? '' : 'No favorite images yet.');
+        }
       } catch (error) {
         setStatus(statusNode, error.message, true);
+      } finally {
         button.disabled = false;
       }
     }
@@ -563,6 +572,8 @@ INDEX_HTML = """<!doctype html>
     function renderImageCard(image) {
       const card = document.createElement('article');
       card.className = image.favorite ? 'thumb favorite' : 'thumb';
+      card.dataset.filename = image.filename;
+      card.dataset.favorite = image.favorite ? 'true' : 'false';
       card.innerHTML = `
         <img src="${escapeHtml(image.url)}" alt="${escapeHtml(image.filename)}">
         <div class="thumb-title">${escapeHtml(image.filename)}</div>
@@ -579,7 +590,11 @@ INDEX_HTML = """<!doctype html>
       const deleteButton = card.querySelector('[data-action="delete"]');
       const status = card.querySelector('.status');
       button.addEventListener('click', () => displayImage(image.filename, status, button));
-      favoriteButton.addEventListener('click', () => setFavorite(image.filename, !image.favorite, status, favoriteButton));
+      favoriteButton.dataset.favorite = image.favorite ? 'true' : 'false';
+      favoriteButton.addEventListener('click', () => {
+        const nextFavorite = favoriteButton.dataset.favorite !== 'true';
+        setFavorite(image.filename, nextFavorite, status, favoriteButton, card);
+      });
       deleteButton.addEventListener('click', () => deleteImage(image.filename, status, deleteButton));
       return card;
     }
