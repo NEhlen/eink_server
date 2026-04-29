@@ -51,6 +51,8 @@ XAI_ASPECT_RATIOS = {"2:3", "3:2"}
 RAW_CLEANUP_DAYS = 30
 BOOST_MODES = {"off", "mild"}
 FAVORITES_LOCK = threading.RLock()
+DEFAULT_IMAGES_PER_PAGE = 24
+MAX_IMAGES_PER_PAGE = 96
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -197,6 +199,15 @@ INDEX_HTML = """<!doctype html>
       margin-bottom: 14px;
       flex-wrap: wrap;
     }
+    .pager {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 14px;
+      flex-wrap: wrap;
+    }
+    .pager .meta { min-width: 120px; text-align: center; }
     .gallery {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
@@ -354,6 +365,11 @@ INDEX_HTML = """<!doctype html>
         </div>
       </div>
       <div class="gallery" id="favoritesGallery"></div>
+      <div class="pager">
+        <button class="secondary" id="favoritesPrevButton" type="button">Previous</button>
+        <div class="meta" id="favoritesPageInfo"></div>
+        <button class="secondary" id="favoritesNextButton" type="button">Next</button>
+      </div>
       <div class="status" id="favoritesStatus"></div>
     </section>
 
@@ -371,6 +387,11 @@ INDEX_HTML = """<!doctype html>
         </div>
       </div>
       <div class="gallery" id="gallery"></div>
+      <div class="pager">
+        <button class="secondary" id="historyPrevButton" type="button">Previous</button>
+        <div class="meta" id="historyPageInfo"></div>
+        <button class="secondary" id="historyNextButton" type="button">Next</button>
+      </div>
       <div class="status" id="historyStatus"></div>
     </section>
   </main>
@@ -405,10 +426,21 @@ INDEX_HTML = """<!doctype html>
     const cleanupRawButton = document.getElementById('cleanupRawButton');
     const favoritesGallery = document.getElementById('favoritesGallery');
     const favoritesStatus = document.getElementById('favoritesStatus');
+    const favoritesPrevButton = document.getElementById('favoritesPrevButton');
+    const favoritesNextButton = document.getElementById('favoritesNextButton');
+    const favoritesPageInfo = document.getElementById('favoritesPageInfo');
     const gallery = document.getElementById('gallery');
     const historyStatus = document.getElementById('historyStatus');
+    const historyPrevButton = document.getElementById('historyPrevButton');
+    const historyNextButton = document.getElementById('historyNextButton');
+    const historyPageInfo = document.getElementById('historyPageInfo');
     const historyModeInputs = Array.from(document.querySelectorAll('input[name="history_image_mode"]'));
     const favoritesModeInputs = Array.from(document.querySelectorAll('input[name="favorites_image_mode"]'));
+    const pageSize = 24;
+    const pagerState = {
+      favorites: { page: 1, totalPages: 1 },
+      history: { page: 1, totalPages: 1 }
+    };
     let selectedFilename = null;
     let generatedFilename = null;
     let activeTab = 'upload';
@@ -433,6 +465,22 @@ INDEX_HTML = """<!doctype html>
     function setStatus(node, message, error = false) {
       node.textContent = message;
       node.classList.toggle('error', error);
+    }
+
+    function setPager(kind, result) {
+      const state = pagerState[kind];
+      state.page = result.page;
+      state.totalPages = result.total_pages;
+      const prevButton = kind === 'favorites' ? favoritesPrevButton : historyPrevButton;
+      const nextButton = kind === 'favorites' ? favoritesNextButton : historyNextButton;
+      const pageInfo = kind === 'favorites' ? favoritesPageInfo : historyPageInfo;
+      prevButton.disabled = result.page <= 1;
+      nextButton.disabled = result.page >= result.total_pages;
+      pageInfo.textContent = result.total ? `Page ${result.page} / ${result.total_pages}` : 'No images';
+    }
+
+    function resetPager(kind) {
+      pagerState[kind].page = 1;
     }
 
     function escapeHtml(value) {
@@ -518,7 +566,11 @@ INDEX_HTML = """<!doctype html>
         setStatus(statusNode, result.favorite ? 'Added to favorites.' : 'Removed from favorites.');
         if (activeTab === 'favorites' && !result.favorite) {
           card.remove();
-          setStatus(favoritesStatus, favoritesGallery.children.length ? '' : 'No favorite images yet.');
+          if (favoritesGallery.children.length) {
+            setStatus(favoritesStatus, '');
+          } else {
+            loadFavorites();
+          }
         }
       } catch (error) {
         setStatus(statusNode, error.message, true);
@@ -599,16 +651,23 @@ INDEX_HTML = """<!doctype html>
       return card;
     }
 
-    async function loadImageGallery({ mode, galleryNode, statusNode, favoritesOnly = false }) {
+    async function loadImageGallery({ kind, mode, galleryNode, statusNode, favoritesOnly = false }) {
       setStatus(statusNode, 'Loading...');
       try {
-        const result = await api('/api/images?mode=' + encodeURIComponent(mode));
-        const images = favoritesOnly ? result.images.filter((image) => image.favorite) : result.images;
+        const state = pagerState[kind];
+        const params = new URLSearchParams({
+          mode,
+          page: String(state.page),
+          per_page: String(pageSize)
+        });
+        if (favoritesOnly) params.set('favorites', '1');
+        const result = await api('/api/images?' + params.toString());
         galleryNode.innerHTML = '';
-        for (const image of images) {
+        for (const image of result.images) {
           galleryNode.appendChild(renderImageCard(image));
         }
-        setStatus(statusNode, images.length ? '' : favoritesOnly ? 'No favorite images yet.' : 'No dithered images yet.');
+        setPager(kind, result);
+        setStatus(statusNode, result.images.length ? '' : favoritesOnly ? 'No favorite images yet.' : 'No dithered images yet.');
       } catch (error) {
         setStatus(statusNode, error.message, true);
       }
@@ -616,12 +675,12 @@ INDEX_HTML = """<!doctype html>
 
     async function loadFavorites() {
       const mode = document.querySelector('input[name="favorites_image_mode"]:checked')?.value || 'preview';
-      await loadImageGallery({ mode, galleryNode: favoritesGallery, statusNode: favoritesStatus, favoritesOnly: true });
+      await loadImageGallery({ kind: 'favorites', mode, galleryNode: favoritesGallery, statusNode: favoritesStatus, favoritesOnly: true });
     }
 
     async function loadHistory() {
       const mode = document.querySelector('input[name="history_image_mode"]:checked')?.value || 'preview';
-      await loadImageGallery({ mode, galleryNode: gallery, statusNode: historyStatus });
+      await loadImageGallery({ kind: 'history', mode, galleryNode: gallery, statusNode: historyStatus });
     }
 
     async function loadCurrentImageTab() {
@@ -638,8 +697,30 @@ INDEX_HTML = """<!doctype html>
     historyTab.addEventListener('click', () => setTab('history'));
     refreshButton.addEventListener('click', loadCurrentImageTab);
     cleanupRawButton.addEventListener('click', cleanupRawFiles);
-    historyModeInputs.forEach((input) => input.addEventListener('change', loadHistory));
-    favoritesModeInputs.forEach((input) => input.addEventListener('change', loadFavorites));
+    historyModeInputs.forEach((input) => input.addEventListener('change', () => {
+      resetPager('history');
+      loadHistory();
+    }));
+    favoritesModeInputs.forEach((input) => input.addEventListener('change', () => {
+      resetPager('favorites');
+      loadFavorites();
+    }));
+    historyPrevButton.addEventListener('click', () => {
+      pagerState.history.page = Math.max(1, pagerState.history.page - 1);
+      loadHistory();
+    });
+    historyNextButton.addEventListener('click', () => {
+      pagerState.history.page = Math.min(pagerState.history.totalPages, pagerState.history.page + 1);
+      loadHistory();
+    });
+    favoritesPrevButton.addEventListener('click', () => {
+      pagerState.favorites.page = Math.max(1, pagerState.favorites.page - 1);
+      loadFavorites();
+    });
+    favoritesNextButton.addEventListener('click', () => {
+      pagerState.favorites.page = Math.min(pagerState.favorites.totalPages, pagerState.favorites.page + 1);
+      loadFavorites();
+    });
   </script>
 </body>
 </html>
@@ -842,6 +923,15 @@ def _history_image_info(path: Path, mode: str, favorites: set[str]) -> dict:
             info["url"] = f"/images/{quote(path.name)}"
             info["missing_display_file"] = True
     return info
+
+
+def _query_int(values: dict[str, list[str]], name: str, default: int, minimum: int, maximum: int) -> int:
+    raw_value = values.get(name, [str(default)])[0]
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
 
 
 def _parse_upload(content_type: str, body: bytes) -> tuple[str, bytes, str, str]:
@@ -1182,17 +1272,37 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_list_images(self, query: str = "") -> None:
         _ensure_dirs()
-        mode = parse_qs(query).get("mode", ["preview"])[0]
+        query_values = parse_qs(query)
+        mode = query_values.get("mode", ["preview"])[0]
         if mode not in {"preview", "display"}:
             mode = "preview"
+        page = _query_int(query_values, "page", 1, 1, 100000)
+        per_page = _query_int(query_values, "per_page", DEFAULT_IMAGES_PER_PAGE, 1, MAX_IMAGES_PER_PAGE)
         images = []
         favorites = _load_favorites()
-        for path in sorted(DITHERED_DIR.glob("*.png"), key=lambda item: item.stat().st_mtime, reverse=True):
+        favorites_only = query_values.get("favorites", ["0"])[0] in {"1", "true", "yes"}
+        paths = [
+            path
+            for path in DITHERED_DIR.glob("*.png")
+            if not favorites_only or path.name in favorites
+        ]
+        paths.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+        total = len(paths)
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        page = min(page, total_pages)
+        start = (page - 1) * per_page
+        for path in paths[start:start + per_page]:
             try:
                 images.append(_history_image_info(path, mode, favorites))
             except (OSError, UnidentifiedImageError):
                 logger.exception("Skipping unreadable image %s", path)
-        self._send_json({"images": images})
+        self._send_json({
+            "images": images,
+            "page": page,
+            "per_page": per_page,
+            "total": total,
+            "total_pages": total_pages,
+        })
 
     def _handle_static_image(self, raw_name: str) -> None:
         try:

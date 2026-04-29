@@ -89,11 +89,11 @@ ideal Waveshare colors, remaps the browser preview to calibrated display colors,
 and sends the ideal-color image to the e-ink screen. The optional mild boost
 adds a small contrast, saturation, and sharpness increase before dithering. The
 favorites tab lists marked images. The history tab lists all old dithered
-images. Both tabs can toggle between preview and display-file views, can mark or
-unmark favorites, and can send any image to the screen. Favorites are stored in
-the local `image_favorites.json` runtime file. Deleting an item removes the
-preview image, matching ideal display image, matching original source file, and
-any favorite marker from disk.
+images. Both tabs are paginated, can toggle between preview and display-file
+views, can mark or unmark favorites, and can send any image to the screen.
+Favorites are stored in the local `image_favorites.json` runtime file. Deleting
+an item removes the preview image, matching ideal display image, matching
+original source file, and any favorite marker from disk.
 
 Raw source files in `images_raw/` are cleaned automatically when the server
 starts if they are older than 30 days. The history tab also has a manual cleanup
