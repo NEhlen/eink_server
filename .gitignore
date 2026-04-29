@@ -17,3 +17,5 @@ images/*
 images_raw/*
 images_display/*
 image_favorites.json
+
+.codex

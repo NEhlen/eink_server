@@ -632,16 +632,23 @@ INDEX_HTML = """<!doctype html>
         <div class="meta">${image.width} x ${image.height}<br>${escapeHtml(image.created_at)}</div>
         <div class="actions">
           <button type="button" data-action="display">Send to Screen</button>
+          ${image.raw_url ? '<button class="secondary" type="button" data-action="raw">Show Raw</button>' : ''}
           <button class="secondary" type="button" data-action="favorite">${image.favorite ? 'Unfavorite' : 'Favorite'}</button>
           <button class="danger" type="button" data-action="delete">Delete</button>
         </div>
         <div class="status"></div>
       `;
       const button = card.querySelector('[data-action="display"]');
+      const rawButton = card.querySelector('[data-action="raw"]');
       const favoriteButton = card.querySelector('[data-action="favorite"]');
       const deleteButton = card.querySelector('[data-action="delete"]');
       const status = card.querySelector('.status');
       button.addEventListener('click', () => displayImage(image.filename, status, button));
+      if (rawButton) {
+        rawButton.addEventListener('click', () => {
+          window.open(image.raw_url, '_blank', 'noopener');
+        });
+      }
       favoriteButton.dataset.favorite = image.favorite ? 'true' : 'false';
       favoriteButton.addEventListener('click', () => {
         const nextFavorite = favoriteButton.dataset.favorite !== 'true';
@@ -789,6 +796,30 @@ def _display_path_from_name(filename: str) -> Path:
     return path
 
 
+def _raw_path_from_name(filename: str) -> Path:
+    clean = Path(filename).name
+    path = (RAW_DIR / clean).resolve()
+    if path.parent != RAW_DIR.resolve():
+        raise ValueError("Invalid filename")
+    if path.suffix.lower() not in ALLOWED_EXTENSIONS:
+        raise ValueError("Only stored image files can be shown")
+    return path
+
+
+def _raw_path_for_dithered(path: Path) -> Path | None:
+    raw_stem = path.stem.removeprefix("dith_")
+    try:
+        return next(
+            candidate
+            for candidate in RAW_DIR.iterdir()
+            if candidate.is_file()
+            and candidate.stem == raw_stem
+            and candidate.suffix.lower() in ALLOWED_EXTENSIONS
+        )
+    except (FileNotFoundError, StopIteration):
+        return None
+
+
 def _normalize_favorite_name(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -852,14 +883,9 @@ def _delete_image_files(filename: str) -> dict:
         raise FileNotFoundError("Image not found")
 
     deleted = []
-    dithered_stem = dithered_path.stem
-    raw_stem = dithered_stem.removeprefix("dith_")
     display_path = _display_path_from_name(dithered_path.name)
-    raw_candidates = [
-        path
-        for path in RAW_DIR.iterdir()
-        if path.is_file() and path.stem == raw_stem
-    ]
+    raw_path = _raw_path_for_dithered(dithered_path)
+    raw_candidates = [raw_path] if raw_path else []
 
     for path in [dithered_path, display_path, *raw_candidates]:
         try:
@@ -915,6 +941,10 @@ def _image_info(path: Path) -> dict:
 def _history_image_info(path: Path, mode: str, favorites: set[str]) -> dict:
     info = _image_info(path)
     info["favorite"] = path.name in favorites
+    raw_path = _raw_path_for_dithered(path)
+    if raw_path:
+        info["raw_url"] = f"/raw-images/{quote(raw_path.name)}"
+        info["raw_filename"] = raw_path.name
     if mode == "display":
         display_path = _display_path_from_name(path.name)
         if display_path.exists():
@@ -1242,6 +1272,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_static_image(parsed.path.removeprefix("/images/"))
         elif parsed.path.startswith("/display-images/"):
             self._handle_static_display_image(parsed.path.removeprefix("/display-images/"))
+        elif parsed.path.startswith("/raw-images/"):
+            self._handle_static_raw_image(parsed.path.removeprefix("/raw-images/"))
         else:
             self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
 
@@ -1324,6 +1356,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not path.exists():
             self._send_json({"error": "Image not found"}, HTTPStatus.NOT_FOUND)
+            return
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        self._send_bytes(path.read_bytes(), content_type)
+
+    def _handle_static_raw_image(self, raw_name: str) -> None:
+        try:
+            path = _raw_path_from_name(unquote(raw_name))
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if not path.exists():
+            self._send_json({"error": "Raw image not found"}, HTTPStatus.NOT_FOUND)
             return
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         self._send_bytes(path.read_bytes(), content_type)
