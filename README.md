@@ -1,3 +1,5 @@
+![Colorful graphene e-ink preview](colorfulgraphene_widescreen.jpg)
+
 ## E-ink image server
 
 ### Install on a Raspberry Pi
