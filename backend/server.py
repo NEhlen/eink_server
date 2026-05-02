@@ -53,6 +53,10 @@ BOOST_MODES = {"off", "mild"}
 FAVORITES_LOCK = threading.RLock()
 DEFAULT_IMAGES_PER_PAGE = 24
 MAX_IMAGES_PER_PAGE = 96
+XAI_ASPECT_PROMPT_HINTS = {
+    "2:3": "Create the image in a portrait 2:3 aspect ratio, taller than wide. Compose the full subject for this vertical frame.",
+    "3:2": "Create the image in a landscape 3:2 aspect ratio, wider than tall. Compose the full subject for this horizontal frame.",
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -1184,6 +1188,26 @@ def _read_xai_error(exc: HTTPError) -> str:
     return f"HTTP {exc.code} {exc.reason}: {body[:500]}"
 
 
+def _xai_prompt_with_aspect(prompt: str, aspect_ratio: str) -> str:
+    hint = XAI_ASPECT_PROMPT_HINTS.get(aspect_ratio)
+    if not hint:
+        return prompt
+    return f"{prompt}\n\nAspect constraint: {hint}"
+
+
+def _image_size(data: bytes) -> tuple[int, int]:
+    with Image.open(BytesIO(data)) as image:
+        return image.size
+
+
+def _matches_requested_orientation(width: int, height: int, aspect_ratio: str) -> bool:
+    if aspect_ratio == "2:3":
+        return height > width
+    if aspect_ratio == "3:2":
+        return width > height
+    return True
+
+
 def _generate_xai_image(prompt: str, aspect_ratio: str, model: str) -> bytes:
     api_key = _load_env_var("XAI_API_KEY")
     if not api_key:
@@ -1191,7 +1215,7 @@ def _generate_xai_image(prompt: str, aspect_ratio: str, model: str) -> bytes:
 
     payload = {
         "model": model,
-        "prompt": prompt,
+        "prompt": _xai_prompt_with_aspect(prompt, aspect_ratio),
         "n": 1,
         "aspect_ratio": aspect_ratio,
         "response_format": "b64_json",
@@ -1230,7 +1254,7 @@ def _style_transfer_xai_image(
     encoded_image = base64.b64encode(source_image).decode("ascii")
     payload = {
         "model": model,
-        "prompt": prompt,
+        "prompt": _xai_prompt_with_aspect(prompt, aspect_ratio),
         "n": 1,
         "aspect_ratio": aspect_ratio,
         "response_format": "b64_json",
@@ -1462,6 +1486,14 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 image_bytes = _style_transfer_xai_image(source_data, content_type, prompt, aspect_ratio, model)
                 source = "xai-style-pro" if model.endswith("-pro") else "xai-style"
+            raw_width, raw_height = _image_size(image_bytes)
+            if not _matches_requested_orientation(raw_width, raw_height, aspect_ratio):
+                logger.warning(
+                    "xAI returned %sx%s for requested %s aspect; dither step will fit it to the requested display frame",
+                    raw_width,
+                    raw_height,
+                    aspect_ratio,
+                )
             info = _store_generated_image(
                 prompt, aspect_ratio, palette_name, image_bytes, model, source=source, boost=boost
             )
