@@ -1,6 +1,8 @@
-![Colorful graphene e-ink preview](colorfulgraphene_widescreen.jpg)
+<img src="./colorfulgraphene_widescreen.jpg" alt="Colorful graphene e-ink preview" width="900">
 
 ## E-ink image server
+
+<img src="./eink_rpi.jpg" alt="Raspberry Pi with attached e-ink display showing an image" width="300">
 
 ### Install on a Raspberry Pi
 
